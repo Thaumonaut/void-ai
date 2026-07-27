@@ -174,6 +174,26 @@ component Label inherits Text {
 }
 
 // Bottom-nav item.
+// Reusable empty-state for content views (icon + hint) — replaces bare "FOUND 0 · \"\"".
+component EmptyState inherits Rectangle {
+    in property <string> icon-d;
+    in property <string> hint;
+    VerticalLayout {
+        alignment: center;
+        spacing: 14px;
+        HorizontalLayout {
+            alignment: center;
+            Icon { width: 44px; height: 44px; d: root.icon-d; ink: VS.ink3; sw: 1.3px; }
+        }
+        Text {
+            text: root.hint;
+            color: VS.ink3;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 component NavTab inherits Rectangle {
     in property <string> icon;
     in property <string> label;
@@ -603,7 +623,10 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- images --
-                                if VS.current-view == "images": Flickable {
+                                if VS.current-view == "images" && VS.images.length == 0: EmptyState {
+                                    icon-d: Ico.images; hint: "Ask Nova to find images.";
+                                }
+                                if VS.current-view == "images" && VS.images.length > 0: Flickable {
                                     viewport-width: self.width;
                                     viewport-height: img-col.preferred-height;
                                     img-col := VerticalLayout {
@@ -763,7 +786,10 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- products --
-                                if VS.current-view == "products": Flickable {
+                                if VS.current-view == "products" && VS.products.length == 0: EmptyState {
+                                    icon-d: Ico.shop; hint: "Ask Nova to shop for something.";
+                                }
+                                if VS.current-view == "products" && VS.products.length > 0: Flickable {
                                     viewport-width: self.width;
                                     viewport-height: prod-col.preferred-height;
                                     prod-col := VerticalLayout {
@@ -832,7 +858,10 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- web --
-                                if VS.current-view == "web": VerticalLayout {
+                                if VS.current-view == "web" && VS.web-blocks.length == 0: EmptyState {
+                                    icon-d: Ico.web; hint: "Ask Nova to look something up.";
+                                }
+                                if VS.current-view == "web" && VS.web-blocks.length > 0: VerticalLayout {
                                     // browser toolbar: tab-count · address · settings (kebab) — matches the concept
                                     Rectangle {
                                         height: 48px;
@@ -955,7 +984,10 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- docs --
-                                if VS.current-view == "docs": VerticalLayout {
+                                if VS.current-view == "docs" && VS.doc-blocks.length == 0: EmptyState {
+                                    icon-d: Ico.docs; hint: "No document open.";
+                                }
+                                if VS.current-view == "docs" && VS.doc-blocks.length > 0: VerticalLayout {
                                     Rectangle {
                                         height: 40px;
                                         Icon { x: 12px; y: (parent.height - self.height) / 2; width: 15px; height: 15px; d: Ico.docs; ink: VS.orange; sw: 1.8px; }

@@ -11,8 +11,8 @@
 
 ## 3. Empty states
 
-- [ ] 3.1 Per-view empty state (icon + "Ask Nova to search…")
-- [ ] 3.2 Suppress `FOUND 0` / `0 stores` headers when the list is empty
+- [x] 3.1 Per-view empty state (reusable `EmptyState` = icon + hint) for images/products/web/docs — verified on sim
+- [x] 3.2 Suppress `FOUND 0` / `0 stores` headers when the list is empty (content branch gated on `length > 0`)
 
 ## 4. Offline detection
 
