@@ -889,7 +889,36 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
             let wu = wu.clone();
             let _ = wu.upgrade_in_event_loop(move |ui| apply_ui_control(&ui, &data));
         });
-        Rc::new(realtime::Realtime::new(status, level, agent_level, transcript, ui_control))
+        // Truthful connection state (not tap-optimistic): `rt-live` follows the real peer
+        // state, and a terminal failure resets `rt-connected` so a re-tap retries.
+        let wcs = ui_weak.clone();
+        let conn_state: realtime::StateCb = std::sync::Arc::new(move |s: realtime::ConnState| {
+            use realtime::ConnState::*;
+            let _ = wcs.upgrade_in_event_loop(move |ui| match s {
+                Connecting | Reconnecting => {
+                    ui.set_rt_live(false);
+                    ui.set_rt_failed(false);
+                }
+                Live => {
+                    ui.set_rt_live(true);
+                    ui.set_rt_failed(false);
+                }
+                Ended => {
+                    ui.set_rt_live(false);
+                    ui.set_rt_failed(false);
+                }
+                Failed => {
+                    // Gave up reconnecting: reset intent so the button/tap becomes a retry,
+                    // and keep the failure visible.
+                    ui.set_rt_live(false);
+                    ui.set_rt_connected(false);
+                    ui.set_rt_failed(true);
+                }
+            });
+        });
+        Rc::new(realtime::Realtime::new(
+            status, conn_state, level, agent_level, transcript, ui_control,
+        ))
     };
     ui.on_realtime_toggle({
         let w = ui_weak.clone();
@@ -926,6 +955,7 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| DEFAULT_BOT.to_string());
+                        ui.set_rt_failed(false);
                         ui.set_rt_status("connecting…".into());
                         realtime.connect(url);
                     } else {

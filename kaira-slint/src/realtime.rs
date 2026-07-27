@@ -40,6 +40,17 @@ pub type TranscriptCb = Arc<dyn Fn(String) + Send + Sync>;
 /// `server-message` as a JSON string, e.g. `{"op":"map","query":"…","pins":[…]}`.
 /// The UI layer parses `op` and drives the view surface. See UI_CONTRACT.md.
 pub type UiControlCb = Arc<dyn Fn(String) + Send + Sync>;
+/// Structured connection state so the UI can be TRUTHFUL about the session (not just
+/// tap-optimistic). Drives `rt-live` (really connected) + resets intent on terminal failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConnState {
+    Connecting,
+    Live,
+    Reconnecting,
+    Failed,
+    Ended,
+}
+pub type StateCb = Arc<dyn Fn(ConnState) + Send + Sync>;
 
 /// Accumulates the conversation into speaker-labelled lines. Consecutive text from
 /// the SAME speaker coalesces into one line (Soniox emits user finals in chunks and
@@ -121,13 +132,16 @@ pub struct Realtime {
 impl Realtime {
     pub fn new(
         status: StatusCb,
+        state: StateCb,
         level: LevelCb,
         agent_level: LevelCb,
         transcript: TranscriptCb,
         ui_control: UiControlCb,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
-        std::thread::spawn(move || rt_thread(rx, status, level, agent_level, transcript, ui_control));
+        std::thread::spawn(move || {
+            rt_thread(rx, status, state, level, agent_level, transcript, ui_control)
+        });
         Self { tx }
     }
     pub fn connect(&self, url: String) {
@@ -151,6 +165,7 @@ impl Realtime {
 fn rt_thread(
     rx: std::sync::mpsc::Receiver<Cmd>,
     status: StatusCb,
+    state: StateCb,
     level: LevelCb,
     agent_level: LevelCb,
     transcript: TranscriptCb,
@@ -171,44 +186,148 @@ fn rt_thread(
     // before starting a new one — otherwise a reconnect races the old still-open
     // connection and the server rejects it ("existing connection active").
     let mut current: Option<(Arc<AtomicBool>, tokio::task::JoinHandle<()>)> = None;
+    // Signal user-stop, then wait for a clean close — but never let a hung pc.close()
+    // wedge the controller (audit MED#4): time-box the join and abort if it overruns.
+    let teardown = |s: Arc<AtomicBool>, h: tokio::task::JoinHandle<()>| {
+        s.store(true, Ordering::SeqCst);
+        let ah = h.abort_handle();
+        if runtime
+            .block_on(tokio::time::timeout(Duration::from_secs(6), h))
+            .is_err()
+        {
+            ah.abort();
+        }
+    };
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Connect(url) => {
                 if let Some((s, h)) = current.take() {
-                    s.store(true, Ordering::SeqCst);
-                    let _ = runtime.block_on(h); // wait for clean close before reconnecting
+                    teardown(s, h);
                 }
                 let stop = Arc::new(AtomicBool::new(false));
                 let st = status.clone();
+                let sc = state.clone();
                 let lv = level.clone();
                 let al = agent_level.clone();
                 let tr = transcript.clone();
                 let uc = ui_control.clone();
                 let s = stop.clone();
-                let h = runtime.spawn(async move { run_session(url, st, lv, al, tr, uc, s).await });
+                let h =
+                    runtime.spawn(async move { run_session(url, st, sc, lv, al, tr, uc, s).await });
                 current = Some((stop, h));
             }
             Cmd::Disconnect => {
                 if let Some((s, h)) = current.take() {
-                    s.store(true, Ordering::SeqCst);
-                    let _ = runtime.block_on(h); // wait for the PC + audio to fully release
+                    teardown(s, h);
                 }
                 status("realtime: disconnected".into());
+                state(ConnState::Ended);
             }
         }
     }
 }
 
+/// Reconnect supervisor: run one attempt; on an unexpected drop (not a user Disconnect),
+/// back off and reconnect. A drop AFTER a real connection retries fast; repeated failures
+/// to ever connect back off and eventually give up ("tap to retry"). `user_stop` is set
+/// only by the controller (Cmd::Disconnect / a new Connect).
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     url: String,
     status: StatusCb,
+    state: StateCb,
     level: LevelCb,
     agent_level: LevelCb,
     transcript: TranscriptCb,
     ui_control: UiControlCb,
-    stop: Arc<AtomicBool>,
+    user_stop: Arc<AtomicBool>,
 ) {
-    status("realtime: connecting…".into());
+    const BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 15];
+    const MAX_FAILS: u32 = 6; // consecutive never-connected attempts before giving up
+    let mut fails: u32 = 0;
+    loop {
+        if user_stop.load(Ordering::SeqCst) {
+            break;
+        }
+        state(if fails == 0 {
+            ConnState::Connecting
+        } else {
+            ConnState::Reconnecting
+        });
+
+        // Per-attempt stop = this attempt dropped (peer Failed/Closed) OR the user stopped.
+        let attempt_stop = Arc::new(AtomicBool::new(false));
+        let did_connect = Arc::new(AtomicBool::new(false));
+        // Propagate a user Disconnect into the running attempt.
+        let watch = {
+            let us = user_stop.clone();
+            let as_ = attempt_stop.clone();
+            tokio::spawn(async move {
+                while !as_.load(Ordering::SeqCst) {
+                    if us.load(Ordering::SeqCst) {
+                        as_.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        run_attempt(
+            &url,
+            &status,
+            &state,
+            &level,
+            &agent_level,
+            &transcript,
+            &ui_control,
+            attempt_stop.clone(),
+            did_connect.clone(),
+        )
+        .await;
+        watch.abort();
+
+        if user_stop.load(Ordering::SeqCst) {
+            break; // user asked to disconnect — no reconnect
+        }
+        // Unexpected drop. A real (connected) session that dropped retries immediately;
+        // an attempt that never connected counts toward the give-up budget.
+        if did_connect.load(Ordering::SeqCst) {
+            fails = 0;
+        } else {
+            fails += 1;
+            if fails >= MAX_FAILS {
+                status("connection failed — tap to retry".into());
+                state(ConnState::Failed);
+                break;
+            }
+        }
+        let secs = BACKOFF_SECS[(fails.saturating_sub(1) as usize).min(BACKOFF_SECS.len() - 1)];
+        status(format!("reconnecting… (try {})", fails + 1));
+        // Interruptible backoff.
+        for _ in 0..(secs * 10) {
+            if user_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// One connection attempt: set up the PC, POST the offer, and run the audio pumps until the
+/// peer drops (which sets `stop`) or the user disconnects. Sets `did_connect` once the PC
+/// reaches Connected, so the supervisor can tell a real drop from a never-connected attempt.
+#[allow(clippy::too_many_arguments)]
+async fn run_attempt(
+    url: &str,
+    status: &StatusCb,
+    state: &StateCb,
+    level: &LevelCb,
+    agent_level: &LevelCb,
+    transcript: &TranscriptCb,
+    ui_control: &UiControlCb,
+    stop: Arc<AtomicBool>,
+    did_connect: Arc<AtomicBool>,
+) {
     transcript(String::new()); // clear last session's transcript
 
     let mut m = MediaEngine::default();
@@ -452,10 +571,12 @@ async fn run_session(
         }));
     }
 
-    // --- connection state → status ---
+    // --- connection state → status + structured state ---
     {
         let st = status.clone();
+        let sc = state.clone();
         let stop_state = stop.clone();
+        let didc = did_connect.clone();
         pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
             st(match s {
                 RTCPeerConnectionState::Connected => "connected · talk to Nova".to_string(),
@@ -465,8 +586,16 @@ async fn run_session(
                 RTCPeerConnectionState::Closed => "realtime: closed".to_string(),
                 _ => "realtime: …".to_string(),
             });
-            if matches!(s, RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) {
-                stop_state.store(true, Ordering::SeqCst);
+            match s {
+                RTCPeerConnectionState::Connected => {
+                    didc.store(true, Ordering::SeqCst);
+                    sc(ConnState::Live);
+                }
+                // Terminal for THIS attempt → stop the pumps; the supervisor reconnects.
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                    stop_state.store(true, Ordering::SeqCst);
+                }
+                _ => {}
             }
             Box::pin(async {})
         }));
@@ -497,8 +626,15 @@ async fn run_session(
         "[dc] offer has data m-line: {}",
         local.sdp.contains("m=application")
     );
-    let resp = match reqwest::Client::new()
-        .post(&url)
+    // Bounded connect: without a timeout a black-holed bot IP hangs "connecting…" for the
+    // OS TCP timeout (minutes) — common on cellular (audit MED#3).
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let resp = match client
+        .post(url)
         .json(&serde_json::json!({ "sdp": local.sdp, "type": "offer" }))
         .send()
         .await
@@ -509,6 +645,12 @@ async fn run_session(
             return;
         }
     };
+    if !resp.status().is_success() {
+        // Surface the real error (e.g. 502, "existing connection active") instead of an
+        // empty SDP → generic "bad answer" (audit LOW#12).
+        status(format!("realtime: bot returned HTTP {}", resp.status().as_u16()));
+        return;
+    }
     let answer: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {

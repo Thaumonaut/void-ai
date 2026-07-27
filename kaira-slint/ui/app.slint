@@ -1038,7 +1038,9 @@ export component MainWindow inherits Window {
     in property <string> opus-result: "";
 
     // ---- realtime agent (Pipecat WebRTC) — the Talk tab ----
-    in-out property <bool> rt-connected: false;
+    in-out property <bool> rt-connected: false;   // intent: user wants to be connected
+    in property <bool> rt-live: false;             // truth: peer connection actually up
+    in property <bool> rt-failed: false;           // gave up reconnecting — offer a retry
     in property <string> rt-status: "Not connected.";
     in property <float> rt-mic-level: 0.0;    // live user mic peak 0..1
     in property <float> rt-agent-level: 0.0;  // live Nova (inbound) peak 0..1
@@ -1176,7 +1178,11 @@ export component MainWindow inherits Window {
                                     triggered => { root.wave-tick(); }
                                 }
                                 Text {
-                                    text: !root.rt-connected ? "TAP NOVA TO CONNECT"
+                                    // Truthful: show the live status while connecting/reconnecting,
+                                    // a retry prompt on failure, and only say "TALKING" once really live.
+                                    text: root.rt-failed ? root.rt-status
+                                        : !root.rt-connected ? "TAP NOVA TO CONNECT"
+                                        : !root.rt-live ? root.rt-status
                                         : root.agent-active ? "NOVA — TAP TO STOP"
                                         : root.user-active ? "YOU"
                                         : "TALKING";
