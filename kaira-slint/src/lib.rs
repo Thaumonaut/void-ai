@@ -144,16 +144,26 @@ fn spawn_image_fetch(ui: &MainWindow, url: String, slot: ImgSlot) {
     }
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let Some(buf) = fetch_pixels(&url) else { return };
+        // On failure, mark the row `failed` (broken-image state) instead of silently
+        // returning — otherwise the placeholder tint persists forever and looks loaded.
+        let result = fetch_pixels(&url);
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let img = slint::Image::from_rgba8(buf);
             let vs = ui.global::<VS>();
+            let ok = result.is_some();
+            let img = result.map(slint::Image::from_rgba8);
             match slot {
-                ImgSlot::Map => vs.set_map_image(img),
+                ImgSlot::Map => {
+                    if let Some(img) = img {
+                        vs.set_map_image(img);
+                    }
+                }
                 ImgSlot::Images(i) => {
                     if let Some(vm) = vs.get_images().as_any().downcast_ref::<VecModel<ImageItem>>() {
                         if let Some(mut row) = vm.row_data(i) {
-                            row.pic = img;
+                            if let Some(img) = img {
+                                row.pic = img;
+                            }
+                            row.failed = !ok;
                             vm.set_row_data(i, row);
                         }
                     }
@@ -161,7 +171,10 @@ fn spawn_image_fetch(ui: &MainWindow, url: String, slot: ImgSlot) {
                 ImgSlot::Products(i) => {
                     if let Some(vm) = vs.get_products().as_any().downcast_ref::<VecModel<Product>>() {
                         if let Some(mut row) = vm.row_data(i) {
-                            row.pic = img;
+                            if let Some(img) = img {
+                                row.pic = img;
+                            }
+                            row.failed = !ok;
                             vm.set_row_data(i, row);
                         }
                     }
@@ -246,6 +259,7 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                             url: it.get("full").and_then(|x| x.as_str()).unwrap_or("").into(),
                             tint: tint(i),
                             pic: Default::default(),
+                            failed: false,
                         })
                         .collect()
                 })
@@ -382,6 +396,7 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                             link: p.get("link").and_then(|x| x.as_str()).unwrap_or("").into(),
                             tint: tint(i),
                             pic: Default::default(),
+                            failed: false,
                         })
                         .collect()
                 })

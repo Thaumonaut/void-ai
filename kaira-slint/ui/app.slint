@@ -10,9 +10,9 @@ export struct TtsRow { engine: string, meta: string }
 
 // ==== VOID_AI dynamic view surface (driven by Nova over the UI-control channel) ====
 export struct ViewTab { id: string, label: string, icon: string }
-export struct ImageItem { cap: string, url: string, tint: color, pic: image }
+export struct ImageItem { cap: string, url: string, tint: color, pic: image, failed: bool }
 export struct MapPin { name: string, note: string, dist: string, rating: string, x: float, y: float, lat: float, lng: float }
-export struct Product { name: string, price: string, store: string, rating: string, ships: string, link: string, tint: color, pic: image }
+export struct Product { name: string, price: string, store: string, rating: string, ships: string, link: string, tint: color, pic: image, failed: bool }
 export struct Block { kind: string, text: string }   // web/doc: kind = "h"|"p"|"h2"|"rule"
 export struct ChatTurn { who: string, text: string, is-user: bool }
 
@@ -656,6 +656,15 @@ component ActiveView inherits Rectangle {
                                             }
                                             // real photo — covers the placeholder once it streams in
                                             Image { width: 100%; height: 100%; source: it.pic; image-fit: cover; }
+                                            // couldn't-load state — otherwise the placeholder looks "loaded" forever
+                                            if it.failed: Text {
+                                                x: 0; width: 100%;
+                                                y: parent.height / 2 + 14px;
+                                                text: "couldn't load";
+                                                color: #ffffffcc;
+                                                font-size: 11px;
+                                                horizontal-alignment: center;
+                                            }
                                             Rectangle {
                                                 y: parent.height - 40px;
                                                 width: 100%;
@@ -816,6 +825,14 @@ component ActiveView inherits Rectangle {
                                                     background: @linear-gradient(140deg, p.tint 0%, p.tint.darker(0.4) 100%);
                                                     Icon { width: 36px; height: 36px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.shop; ink: #ffffff44; sw: 1.5px; }
                                                     Image { width: 100%; height: 100%; source: p.pic; image-fit: cover; }
+                                                    if p.failed: Text {
+                                                        x: 0; width: 100%;
+                                                        y: parent.height / 2 + 16px;
+                                                        text: "couldn't load";
+                                                        color: #ffffffcc;
+                                                        font-size: 11px;
+                                                        horizontal-alignment: center;
+                                                    }
                                                 }
                                                 // footer: name + rating (left) · price + store (right)
                                                 Rectangle {
