@@ -148,8 +148,19 @@ pub(crate) fn files_dir() -> String {
         // works on both old Android and scoped-storage 11+.
         "/sdcard/kaira".to_string()
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
     {
+        // The app-sandbox Documents dir — works on a REAL DEVICE and the simulator. iOS sets
+        // HOME to the app's container, so $HOME/Documents is the standard writable location.
+        // (Previously this returned a dev host path that ONLY the simulator could read, so
+        // settings persistence + the realtime_url override silently failed on every device.)
+        std::env::var("HOME")
+            .map(|h| format!("{h}/Documents"))
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // Desktop-dev convenience (VOIDAI_DEMO runs read seed/config from here).
         "/Users/jek/Documents/Projects/Personal/Rust-Mobile/voicelab".to_string()
     }
 }
