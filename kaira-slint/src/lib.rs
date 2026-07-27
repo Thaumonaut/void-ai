@@ -121,6 +121,21 @@ enum ImgSlot {
     Map,
 }
 
+thread_local! {
+    // Bumped whenever the images/products model is replaced, so a slow async fetch that
+    // lands after a NEW search can't write its image into the new model's row (audit #9 —
+    // stale-async overwrite). Fetch captures the gen at spawn; the landing drops if it moved.
+    static IMAGES_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PRODUCTS_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn bump_images_gen() {
+    IMAGES_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+}
+fn bump_products_gen() {
+    PRODUCTS_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
 /// Fetch + decode an image URL into a Slint-ready RGBA buffer (blocking; run off the UI thread).
 fn fetch_pixels(url: &str) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
     let client = reqwest::blocking::Client::builder()
@@ -142,12 +157,27 @@ fn spawn_image_fetch(ui: &MainWindow, url: String, slot: ImgSlot) {
     if url.is_empty() {
         return;
     }
+    // Generation of the model this fetch targets, captured at spawn.
+    let gen = match slot {
+        ImgSlot::Images(_) => IMAGES_GEN.with(|g| g.get()),
+        ImgSlot::Products(_) => PRODUCTS_GEN.with(|g| g.get()),
+        ImgSlot::Map => 0,
+    };
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         // On failure, mark the row `failed` (broken-image state) instead of silently
         // returning — otherwise the placeholder tint persists forever and looks loaded.
         let result = fetch_pixels(&url);
         let _ = weak.upgrade_in_event_loop(move |ui| {
+            // Drop a stale result — the model was replaced since this fetch started (#9).
+            let stale = match slot {
+                ImgSlot::Images(_) => IMAGES_GEN.with(|g| g.get()) != gen,
+                ImgSlot::Products(_) => PRODUCTS_GEN.with(|g| g.get()) != gen,
+                ImgSlot::Map => false,
+            };
+            if stale {
+                return;
+            }
             let vs = ui.global::<VS>();
             let ok = result.is_some();
             let img = result.map(slint::Image::from_rgba8);
@@ -266,6 +296,7 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                 .unwrap_or_default();
             let urls: Vec<String> = items.iter().map(|it| it.url.to_string()).collect();
             vs.set_images(ModelRc::from(Rc::new(VecModel::from(items))));
+            bump_images_gen();
             vs.set_images_query(sget("query").into());
             switch(ui, "images", true);
             for (i, u) in urls.into_iter().enumerate() {
@@ -407,6 +438,7 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                 .map(|a| a.iter().map(|p| p.get("thumb").and_then(|x| x.as_str()).unwrap_or("").to_string()).collect())
                 .unwrap_or_default();
             vs.set_products(ModelRc::from(Rc::new(VecModel::from(items))));
+            bump_products_gen();
             vs.set_products_query(sget("query").into());
             switch(ui, "products", true);
             for (i, u) in thumbs.into_iter().enumerate() {
