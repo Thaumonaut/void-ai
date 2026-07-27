@@ -127,6 +127,8 @@ thread_local! {
     // stale-async overwrite). Fetch captures the gen at spawn; the landing drops if it moved.
     static IMAGES_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static PRODUCTS_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Last static-map tile URL, so tap-to-retry can re-fetch it (map-unavailable affordance).
+    static LAST_MAP_URL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 fn bump_images_gen() {
@@ -183,6 +185,10 @@ fn spawn_image_fetch(ui: &MainWindow, url: String, slot: ImgSlot) {
             let img = result.map(slint::Image::from_rgba8);
             match slot {
                 ImgSlot::Map => {
+                    // The static tile is the map on desktop/Android; on iOS the live webview
+                    // covers it, so its load state (not this fetch) drives map-failed there.
+                    #[cfg(not(target_os = "ios"))]
+                    vs.set_map_failed(!ok);
                     if let Some(img) = img {
                         vs.set_map_image(img);
                     }
@@ -260,9 +266,11 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
     let sget = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let bget = |k: &str, d: bool| v.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
     // Content ops open + switch to their view, and honor an optional `collapse`.
+    // Content landing clears any "Nova is working" pill for the view being shown.
     let switch = |ui: &MainWindow, view: &str, collapse_default: bool| {
         ensure_open(ui, view);
         ui.global::<VS>().set_current_view(view.into());
+        ui.global::<VS>().set_working_view("".into());
         if bget("collapse", collapse_default) {
             ui.global::<VS>().set_collapsed(true);
         }
@@ -357,7 +365,10 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                 vs.set_map_nav_url("".into());
             }
             switch(ui, "map", true);
-            spawn_image_fetch(ui, sget("img"), ImgSlot::Map);
+            let map_url = sget("img");
+            LAST_MAP_URL.with(|u| *u.borrow_mut() = map_url.clone());
+            vs.set_map_failed(false);
+            spawn_image_fetch(ui, map_url, ImgSlot::Map);
             // iOS: drive the live Mapbox webview (ios_map) with the same pins — markers + a
             // destination pin for directions; the page fits/flies to them. (The static tile
             // above still serves other platforms + shows until the live map paints.)
@@ -471,6 +482,17 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
             vs.set_doc_name(sget("name").into());
             vs.set_doc_page(sget("page").into());
             switch(ui, "docs", false);
+        }
+        // Nova signals she's running a slow tool for `view`: show a "working" pill there until
+        // the matching content op lands (which clears it via `switch`). Optional `label`.
+        "working" => {
+            let view = sget("view");
+            if !view.is_empty() {
+                ensure_open(ui, &view);
+                vs.set_current_view(view.as_str().into());
+                vs.set_working_label(sget("label").into());
+                vs.set_working_view(view.as_str().into());
+            }
         }
         // plan-then-handoff: open the maps deep link in the phone's nav app
         "navigate" => {
@@ -1141,6 +1163,20 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                             spawn_image_fetch(&ui, url, ImgSlot::Products(i as usize));
                         }
                     }
+                }
+            }
+        }
+    });
+
+    // Tap-to-retry the static map tile after a failed load.
+    ui.on_retry_map({
+        let w = ui_weak.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                let url = LAST_MAP_URL.with(|u| u.borrow().clone());
+                ui.global::<VS>().set_map_failed(false);
+                if !url.is_empty() {
+                    spawn_image_fetch(&ui, url, ImgSlot::Map);
                 }
             }
         }

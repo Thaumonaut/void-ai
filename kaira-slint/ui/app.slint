@@ -89,6 +89,12 @@ export global VS {
     in-out property <string> doc-page;
     in-out property <[Block]> doc-blocks;
 
+    // --- transient tool state ---
+    // which view Nova is actively fetching for ("" = none); shows a "working" pill until content lands.
+    in-out property <string> working-view;
+    in-out property <string> working-label;
+    in-out property <bool> map-failed;      // the static map tile couldn't load (tap to retry)
+
     // --- user actions the UI can't do alone (Rust mutates the open-views model) ---
     callback add-view(string);    // open a view + switch to it
     callback close-view(string);  // close a view (never chat)
@@ -187,6 +193,40 @@ component EmptyState inherits Rectangle {
         }
         Text {
             text: root.hint;
+            color: VS.ink3;
+            font-size: 14px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// Shown in a content view while Nova is running a slow tool for it (before results land):
+// three softly-pulsing dots + an optional status label ("searching images…").
+component WorkingPill inherits Rectangle {
+    in property <string> label;
+    property <bool> pulse: false;
+    Timer {
+        interval: 600ms;
+        running: true;
+        triggered => { root.pulse = !root.pulse; }
+    }
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 9px;
+            for i in 3: Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: VS.orange;
+                opacity: root.pulse ? 1.0 : 0.28;
+                animate opacity { duration: 500ms; easing: ease-in-out; delay: i * 150ms; }
+            }
+        }
+        Text {
+            text: root.label != "" ? root.label : "Nova is working…";
             color: VS.ink3;
             font-size: 14px;
             horizontal-alignment: center;
@@ -572,6 +612,7 @@ component ActiveView inherits Rectangle {
     callback report-map-geom(length, length, length, length);
     callback retry-image(int);
     callback retry-product(int);
+    callback retry-map();
     background: VS.card;
     border-radius: VS.radius;
     border-width: 1px;
@@ -625,10 +666,13 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- images --
-                                if VS.current-view == "images" && VS.images.length == 0: EmptyState {
+                                if VS.current-view == "images" && VS.working-view == "images": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "images" && VS.images.length == 0 && VS.working-view != "images": EmptyState {
                                     icon-d: Ico.images; hint: "Ask Nova to find images.";
                                 }
-                                if VS.current-view == "images" && VS.images.length > 0: Flickable {
+                                if VS.current-view == "images" && VS.images.length > 0 && VS.working-view != "images": Flickable {
                                     viewport-width: self.width;
                                     viewport-height: img-col.preferred-height;
                                     img-col := VerticalLayout {
@@ -724,6 +768,27 @@ component ActiveView inherits Rectangle {
                                         changed width => { root.report-map-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
                                         changed height => { root.report-map-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
                                         Image { width: 100%; height: 100%; source: VS.map-image; image-fit: contain; }
+                                        // The static tile couldn't load (offline / tile server down). Covers the
+                                        // area with a tap-to-retry affordance. (iOS shows the live webview here;
+                                        // a webview load failure is reported separately.)
+                                        if VS.map-failed: Rectangle {
+                                            background: VS.card;
+                                            VerticalLayout {
+                                                alignment: center;
+                                                spacing: 14px;
+                                                HorizontalLayout {
+                                                    alignment: center;
+                                                    Icon { width: 44px; height: 44px; d: Ico.map; ink: VS.ink3; sw: 1.3px; }
+                                                }
+                                                Text {
+                                                    text: "map unavailable · tap to retry";
+                                                    color: VS.ink3;
+                                                    font-size: 14px;
+                                                    horizontal-alignment: center;
+                                                }
+                                            }
+                                            TouchArea { clicked => { root.retry-map(); } }
+                                        }
                                     }
                                     // directions only: ETA + one-tap handoff to the phone's nav app,
                                     // so you can study the route in-app first, then choose to navigate.
@@ -800,10 +865,13 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- products --
-                                if VS.current-view == "products" && VS.products.length == 0: EmptyState {
+                                if VS.current-view == "products" && VS.working-view == "products": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "products" && VS.products.length == 0 && VS.working-view != "products": EmptyState {
                                     icon-d: Ico.shop; hint: "Ask Nova to shop for something.";
                                 }
-                                if VS.current-view == "products" && VS.products.length > 0: Flickable {
+                                if VS.current-view == "products" && VS.products.length > 0 && VS.working-view != "products": Flickable {
                                     viewport-width: self.width;
                                     viewport-height: prod-col.preferred-height;
                                     prod-col := VerticalLayout {
@@ -883,10 +951,13 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- web --
-                                if VS.current-view == "web" && VS.web-blocks.length == 0: EmptyState {
+                                if VS.current-view == "web" && VS.working-view == "web": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "web" && VS.web-blocks.length == 0 && VS.working-view != "web": EmptyState {
                                     icon-d: Ico.web; hint: "Ask Nova to look something up.";
                                 }
-                                if VS.current-view == "web" && VS.web-blocks.length > 0: VerticalLayout {
+                                if VS.current-view == "web" && VS.web-blocks.length > 0 && VS.working-view != "web": VerticalLayout {
                                     // browser toolbar: tab-count · address · settings (kebab) — matches the concept
                                     Rectangle {
                                         height: 48px;
@@ -1009,10 +1080,13 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- docs --
-                                if VS.current-view == "docs" && VS.doc-blocks.length == 0: EmptyState {
+                                if VS.current-view == "docs" && VS.working-view == "docs": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "docs" && VS.doc-blocks.length == 0 && VS.working-view != "docs": EmptyState {
                                     icon-d: Ico.docs; hint: "No document open.";
                                 }
-                                if VS.current-view == "docs" && VS.doc-blocks.length > 0: VerticalLayout {
+                                if VS.current-view == "docs" && VS.doc-blocks.length > 0 && VS.working-view != "docs": VerticalLayout {
                                     Rectangle {
                                         height: 40px;
                                         Icon { x: 12px; y: (parent.height - self.height) / 2; width: 15px; height: 15px; d: Ico.docs; ink: VS.orange; sw: 1.8px; }
@@ -1061,6 +1135,7 @@ export component MainWindow inherits Window {
     callback map-active-changed(bool);
     callback retry-image(int);   // re-fetch a failed image thumbnail
     callback retry-product(int); // re-fetch a failed product thumbnail
+    callback retry-map();        // re-fetch the failed static map tile
     property <bool> map-active: VS.current-view == "map";
     changed map-active => { self.map-active-changed(self.map-active); }
 
@@ -1352,7 +1427,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } }
+                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "right": SwitcherRail {
                                 on-left: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
@@ -1371,7 +1446,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } }
+                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "bottom": SwitcherRailH {
                                 drop-down: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
