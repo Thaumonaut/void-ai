@@ -1,0 +1,26 @@
+{
+  "Moonshine\u00b7EN": {
+    "correct": 1,
+    "total": 1
+  },
+  "Whisper\u00b7base": {
+    "correct": 1,
+    "total": 1
+  },
+  "Omni\u00b7CTC": {
+    "correct": 1,
+    "total": 1
+  },
+  "Dolphin\u00b7CTC": {
+    "correct": 0,
+    "total": 1
+  },
+  "Qwen3\u00b7multi": {
+    "correct": 1,
+    "total": 1
+  },
+  "Soniox": {
+    "correct": 1,
+    "total": 1
+  }
+}

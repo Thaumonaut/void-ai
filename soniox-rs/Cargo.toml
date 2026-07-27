@@ -1,0 +1,20 @@
+[package]
+name = "soniox-rs"
+version = "0.1.0"
+edition = "2021"
+
+# Minimal native Soniox WebSocket client, to prove the Kaira Rust/Android client
+# can reach Soniox STT. TLS via rustls + bundled webpki-roots (no dependency on
+# the Android system cert store). tokio-tungstenite 0.21 → rustls 0.22 uses the
+# `ring` crypto provider, which cross-compiles cleanly to aarch64-linux-android
+# (avoids aws-lc-rs/cmake).
+
+[[bin]]
+name = "stt"
+path = "src/bin/stt.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde_json = "1"

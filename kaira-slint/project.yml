@@ -1,0 +1,58 @@
+# XcodeGen spec for the iOS build. `xcodegen` reads this → KairaSlint.xcodeproj.
+# The app target has NO Xcode-compiled sources (`sources: []`): cargo/rustc build the
+# entire executable (Slint winit+Skia backend, which internally calls UIApplicationMain),
+# and the postCompile script lipos it into the .app. All frameworks (UIKit/Metal/
+# QuartzCore/CoreAudio/AudioToolbox/…) are emitted by the crates' build scripts.
+name: KairaSlint
+options:
+  bundleIdPrefix: ai.gmango
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    # The postCompile script shells out to cargo — sandboxing would block it.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # Automatic signing with your Development team (change to 92SQPWU7CJ if the device
+    # is registered under the "Jacob Perry" team instead of gmango's BP44WBG86J).
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: BP44WBG86J
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+targets:
+  KairaSlint:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    info:
+      path: ios/Info.plist
+      properties:
+        CFBundleDisplayName: VOID_AI
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        # REQUIRED — cpal touches the mic; without this the app hard-crashes on capture.
+        NSMicrophoneUsageDescription: "VOID_AI uses the microphone for the live voice conversation."
+        # Location → sent to the bot so directions start from where you actually are.
+        NSLocationWhenInUseUsageDescription: "VOID_AI uses your location so Nova can give directions from where you are."
+        UIBackgroundModes: [audio]
+        # Allow plain HTTP to the bot's raw IP (no TLS on a bare Droplet IP yet). iOS ATS
+        # blocks non-HTTPS by default. Tighten to a domain + HTTPS (Caddy auto-TLS) later.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UILaunchScreen:
+          UIImageRespectsSafeAreaInsets: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    # Only the asset catalog (app icon) — cargo/rustc build the whole executable, so no
+    # code sources here. Xcode's actool processes the .xcassets; it won't compile Rust.
+    sources:
+      - path: ios/Assets.xcassets
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    postCompileScripts:
+      - name: "Cargo build (Rust → executable)"
+        script: |
+          ./ios/build_for_ios_with_cargo.bash kaira-slint
+        # outputFiles (the produced executable), NOT outputFileLists (which expects a
+        # .xcfilelist file — pointing it at the exe gives "Unable to load file list").
+        outputFiles:
+          - $TARGET_BUILD_DIR/$EXECUTABLE_PATH

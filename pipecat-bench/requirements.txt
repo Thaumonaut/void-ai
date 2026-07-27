@@ -1,0 +1,31 @@
+# Kaira Pipecat voice-agent benchmark -- verified against pipecat-ai 1.5.0 (Jul 2026).
+# Python 3.11+ required (pipecat requires-python >=3.11; system Python 3.9 will NOT work).
+#
+# Install (uv recommended):
+#     uv venv --python 3.11 .venv && source .venv/bin/activate
+#     uv pip install -r requirements.txt
+# or with plain pip inside a 3.11 venv:
+#     pip install -r requirements.txt
+
+# Core + default cascade stack + self-hosted WebRTC transport + dev runner.
+#   silero   -> Silero VAD (barge-in / interruption)
+#   webrtc   -> aiortc (SmallWebRTCTransport server AND the bench.py client)
+#   deepgram -> default STT
+#   cartesia -> default TTS
+#   openai   -> default LLM (gpt-4o) + OpenAI Realtime s2s
+#   runner   -> uvicorn/fastapi/dotenv for the dev runner
+pipecat-ai[silero,webrtc,deepgram,cartesia,openai,runner]==1.5.0
+
+# Prebuilt browser test UI served by the standalone SmallWebRTC server (server.py).
+pipecat-ai-small-webrtc-prebuilt>=2.5.0
+
+# numpy is pulled transitively but pinned here because bench.py uses it for RMS energy.
+numpy>=1.26
+
+# ── Optional providers -- uncomment the ones you select in .env ────────────
+# Best Indonesian + ID<->EN code-switching. Enables Gemini Live (s2s) and Google STT/TTS/LLM:
+# pipecat-ai[google]==1.5.0
+# ElevenLabs multilingual TTS (speaks Indonesian well):
+# pipecat-ai[elevenlabs]==1.5.0
+# AssemblyAI STT:
+# pipecat-ai[assemblyai]==1.5.0

@@ -1,0 +1,130 @@
+[package]
+name = "kaira-slint"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+# Native-rendered Slint harness for testing on-device Supertonic-3 TTS on old
+# Android hardware (no WebView — unlike Dioxus, which the A3's Chrome-68 can't run).
+
+# cdylib = the Android .so (cargo apk). "lib" (rlib) lets src/main.rs — the iOS &
+# desktop entry point — link the crate; harmless to Android (cargo apk builds --lib).
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# Backend is target-specific (Android = android-activity, iOS/desktop = winit); the
+# renderer (Skia/Metal on iOS) + compat are shared. See the per-target dep tables below.
+slint = { version = "1", default-features = false, features = ["compat-1-2", "renderer-skia"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rodio = { version = "0.19", default-features = false }
+cpal = "0.15"
+
+# Soniox cloud TTS engine (server-tier voice, alongside on-device Piper/Supertonic).
+# tokio-tungstenite 0.21 → rustls 0.22 (ring) + webpki-roots: cross-compiles clean
+# to android and bundles CA certs (no system cert store needed). Proven in soniox-rs.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+base64 = "0.22"
+
+# Cloud LLM step for the round-trip test (OpenAI-compatible chat completions).
+# reqwest 0.11 rustls-tls = rustls 0.21 + ring + webpki-roots → cross-compiles to
+# android (unlike 0.12's aws-lc-rs default, which needs a C toolchain).
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
+# Decode fetched image bytes (JPEG/PNG) into RGBA for Slint's Image::from_rgba8 — this
+# is what makes the view surface show REAL photos/thumbnails/map tiles instead of
+# colored placeholder tiles. Pure-Rust decoders, so it cross-compiles to android/ios.
+# webp is needed for shopping thumbnails: SerpApi / Google image thumbnails come back as
+# WebP, so without this the product cards can't decode their pictures. Pure-Rust (image-webp)
+# → cross-compiles to android/ios like the others.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# Android backend (android-activity) + the sherpa-onnx Lab engines (need the prebuilt
+# onnxruntime .so shipped only for Android) + the JNI native-STT bridge.
+[target.'cfg(target_os = "android")'.dependencies]
+slint = { version = "1", default-features = false, features = ["backend-android-activity-06"] }
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
+jni = "0.21"
+ndk-context = "0.1"
+
+# iOS + desktop use the winit backend. raw-window-handle-06 exposes the native UIView
+# (via Window::window_handle) so ios_webview can addSubview a WKWebView sub-window.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+slint = { version = "1", default-features = false, features = ["backend-winit", "raw-window-handle-06"] }
+
+# The realtime-agent client (Pipecat SmallWebRTC) — cross-compile + on-device
+# ICE/DTLS handshake spike-verified on aarch64 Android; pure-Rust (ring/rustls) so it
+# also cross-compiles to aarch64-apple-ios. Powers the Talk feature on both platforms.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+webrtc = "0.17"
+
+# iOS: AVAudioSession config (objc2-avf-audio) + a native Voice-Processing I/O audio
+# unit (coreaudio-sys) that does mic capture + speaker playback + hardware AEC/noise
+# suppression — replaces cpal+rodio on iOS so a background fan doesn't swamp the VAD.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-avf-audio = { version = "0.3", features = ["AVAudioSession"] }
+coreaudio-sys = { version = "0.2.18", features = ["audio_unit", "audio_toolbox", "core_audio"] }
+# CoreLocation (CLLocationManager) → the phone's GPS, sent to the bot so directions start
+# from where the user is (mirrors the Android LocationManager path in native_stt).
+objc2-core-location = { version = "0.3", features = ["CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL"] }
+# UIApplication.openURL → hand a maps/web URL off to the system browser / Maps app (iOS
+# analogue of the Android ACTION_VIEW intent in native_stt::launch_url).
+objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIView"] }
+# In-app WKWebView sub-window (ios_webview): CGRect for the child-view frame + the raw
+# UIView handle from Slint's winit window. WKWebView itself is driven via the ObjC runtime
+# (class!/msg_send!) and WebKit.framework is linked in build.rs — no objc2-web-kit dep.
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+raw-window-handle = "0.6"
+
+[build-dependencies]
+slint-build = "1"
+
+[package.metadata.android]
+package = "com.kaira.voicelab"
+apk_name = "VoiceLab"
+runtime_libs = "runtime_libs"
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+# Location → sent to the bot so directions start from where the user actually is.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_FINE_LOCATION"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_COARSE_LOCATION"
+
+# Read bundled/side-loaded models from shared storage (/sdcard/kaira). On old
+# Android (A3) READ_EXTERNAL_STORAGE suffices; on 11+ scoped storage needs
+# MANAGE_EXTERNAL_STORAGE (granted via `appops set ... allow` for the harness).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
+
+[package.metadata.android.application]
+label = "Voice Lab"
+
+# Sign release with the debug keystore (this is a test harness, not for distribution).
+[package.metadata.android.signing.release]
+path = "/Users/jek/.android/debug.keystore"
+keystore_password = "android"
+
+# Strip debug info from the debug build — otherwise libkaira_slint.so is ~484 MB
+# (webrtc + slint + skia statically linked with full debuginfo) and won't fit a
+# small emulator /data. debug_assertions stays on, so the demo seed still runs.
+[profile.dev]
+strip = "debuginfo"

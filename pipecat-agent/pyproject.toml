@@ -1,0 +1,15 @@
+[project]
+name = "kaira-pipecat-agent"
+version = "0.1.0"
+description = "Kaira realtime voice agent — Soniox STT/TTS + Gemma-4/Cerebras LLM on Pipecat"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # Pipecat + just the services we use. `webrtc` pulls the SmallWebRTC transport
+    # and its browser test client; `silero` pulls the Silero VAD (torch).
+    "pipecat-ai[soniox,openrouter,silero,webrtc,runner]>=1.6.0",
+    "python-dotenv>=1.0",
+    "loguru>=0.7",
+]
+
+[tool.uv]
+# torch (Silero) wheels are large; nothing else special.

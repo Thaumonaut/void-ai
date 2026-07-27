@@ -1,0 +1,24 @@
+[package]
+name = "voicelab"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+# Standalone probe: run on-device speech models (Supertonic-3 TTS) via
+# sherpa-onnx directly in Rust. Desktop links the static libs (auto-downloaded);
+# Android links the prebuilt shared .so (SHERPA_ONNX_LIB_DIR) + libc++_shared.
+
+[dependencies]
+serde_json = "1"
+
+# Host-only, for the whisper_check example (reads test wavs).
+[dev-dependencies]
+hound = "3"
+
+# Host/desktop: static, prebuilt libs auto-download.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+sherpa-onnx = "1.13"
+
+# Android: shared libs from the prebuilt jniLibs (via SHERPA_ONNX_LIB_DIR).
+[target.'cfg(target_os = "android")'.dependencies]
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }

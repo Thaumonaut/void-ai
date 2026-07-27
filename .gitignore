@@ -1,0 +1,37 @@
+# ---- secrets (NEVER commit) ----
+.env
+.env.local
+.env.*
+!.env.example
+
+# ---- Python (pipecat-agent, pipecat-bench, ...) ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- Rust (kaira-slint, soniox-rs, ...) ----
+target/
+**/target/
+*.apk
+
+# ---- macOS / editor ----
+.DS_Store
+*.swp
+
+# ---- iOS build output (xcodebuild derivedData — regenerable) ----
+build_sim/
+build_dev*/
+*.dSYM/
+DerivedData/
+*.app/
+
+# ---- ML model weights + large prebuilt native libs (fetch/rebuild separately) ----
+*.onnx
+*.ort
+*.so
+espeak-ng-data/
+
+# ---- servo desktop spike (recipe captured in memory) ----
+_servo-spike/

@@ -1,0 +1,20 @@
+# Fly.io config for the Pipecat SmallWebRTC voice bot (VOID_AI / Nova).
+# Media rides Cloudflare TURN (bot.py injects a relay candidate into aiortc), so this is
+# a plain HTTPS app — NO [[services]] udp block, NO dedicated IPv4 needed.
+# Deploy: `fly deploy` (remote builder). Secrets: `fly secrets set SONIOX_API_KEY=... OPENROUTER_API_KEY=... TURN_TOKEN_ID=... TURN_API_TOKEN=...`
+app = "void-ai-agent"
+primary_region = "sjc"   # US-West for testing; switch to "sin" (Singapore) for the Indonesia rollout
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep one machine warm — onnx/model load + import is slow to cold-start, and this is
+  # a realtime voice agent (cold start would add seconds to time-to-first-audio).
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "performance-1x"   # 1 dedicated vCPU + 2GB — realtime audio + onnx want steady CPU
