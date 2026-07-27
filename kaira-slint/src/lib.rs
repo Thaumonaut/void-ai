@@ -428,6 +428,7 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                             tint: tint(i),
                             pic: Default::default(),
                             failed: false,
+                            thumb: p.get("thumb").and_then(|x| x.as_str()).unwrap_or("").into(),
                         })
                         .collect()
                 })
@@ -1106,6 +1107,44 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
             }
         }
     }
+
+    // Tap-to-retry a failed image/product thumbnail: clear `failed` and re-fetch its URL.
+    ui.on_retry_image({
+        let w = ui_weak.clone();
+        move |i: i32| {
+            if let Some(ui) = w.upgrade() {
+                let vs = ui.global::<VS>();
+                if let Some(vm) = vs.get_images().as_any().downcast_ref::<VecModel<ImageItem>>() {
+                    if let Some(mut row) = vm.row_data(i as usize) {
+                        let url = row.url.to_string();
+                        row.failed = false;
+                        vm.set_row_data(i as usize, row);
+                        if !url.is_empty() {
+                            spawn_image_fetch(&ui, url, ImgSlot::Images(i as usize));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    ui.on_retry_product({
+        let w = ui_weak.clone();
+        move |i: i32| {
+            if let Some(ui) = w.upgrade() {
+                let vs = ui.global::<VS>();
+                if let Some(vm) = vs.get_products().as_any().downcast_ref::<VecModel<Product>>() {
+                    if let Some(mut row) = vm.row_data(i as usize) {
+                        let url = row.thumb.to_string();
+                        row.failed = false;
+                        vm.set_row_data(i as usize, row);
+                        if !url.is_empty() {
+                            spawn_image_fetch(&ui, url, ImgSlot::Products(i as usize));
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // iOS: live interactive Mapbox map behind the "map" view. Slint reports the map region's
     // absolute geometry (report-map-geom) so we position a WKWebView there; map-active-changed

@@ -6,7 +6,7 @@
 ## 2. Error / failed-fetch states
 
 - [x] 2.1 Track a per-slot `failed` flag; set it on fetch failure so images/products show "couldn't load" instead of a permanent placeholder — verified on sim
-- [ ] 2.2 Tap-to-retry (re-fetch) for failed image/product thumbnails
+- [x] 2.2 Tap-to-retry (re-fetch) for failed image/product thumbnails — verified on sim (failed tile → tap → image loads)
 - [ ] 2.3 "Map unavailable" affordance when the map tile/webview can't load
 - [x] 2.4 Fix stale-async overwrite (audit #9): per-collection generation counter — bump on model replace, capture at fetch spawn, drop stale landings. Verified on sim (before: phantom photo; after: "couldn't load")
 

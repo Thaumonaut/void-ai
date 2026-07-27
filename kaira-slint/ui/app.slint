@@ -12,7 +12,7 @@ export struct TtsRow { engine: string, meta: string }
 export struct ViewTab { id: string, label: string, icon: string }
 export struct ImageItem { cap: string, url: string, tint: color, pic: image, failed: bool }
 export struct MapPin { name: string, note: string, dist: string, rating: string, x: float, y: float, lat: float, lng: float }
-export struct Product { name: string, price: string, store: string, rating: string, ships: string, link: string, tint: color, pic: image, failed: bool }
+export struct Product { name: string, price: string, store: string, rating: string, ships: string, link: string, tint: color, pic: image, failed: bool, thumb: string }
 export struct Block { kind: string, text: string }   // web/doc: kind = "h"|"p"|"h2"|"rule"
 export struct ChatTurn { who: string, text: string, is-user: bool }
 
@@ -570,6 +570,8 @@ component SwitcherRailH inherits HorizontalLayout {
 component ActiveView inherits Rectangle {
     callback open-url(string);
     callback report-map-geom(length, length, length, length);
+    callback retry-image(int);
+    callback retry-product(int);
     background: VS.card;
     border-radius: VS.radius;
     border-width: 1px;
@@ -660,7 +662,7 @@ component ActiveView inherits Rectangle {
                                             if it.failed: Text {
                                                 x: 0; width: 100%;
                                                 y: parent.height / 2 + 14px;
-                                                text: "couldn't load";
+                                                text: "couldn't load · tap to retry";
                                                 color: #ffffffcc;
                                                 font-size: 11px;
                                                 horizontal-alignment: center;
@@ -678,8 +680,11 @@ component ActiveView inherits Rectangle {
                                                 color: white;
                                                 font-size: 11.5px;
                                             }
-                                            // tap to expand fullscreen (swipe between them there)
-                                            TouchArea { clicked => { VS.lightbox-index = i; VS.lightbox-open = true; } }
+                                            // tap: retry a failed load, else expand fullscreen
+                                            TouchArea { clicked => {
+                                                if (it.failed) { root.retry-image(i); }
+                                                else { VS.lightbox-index = i; VS.lightbox-open = true; }
+                                            } }
                                         }
                                     }
                                 }
@@ -811,7 +816,7 @@ component ActiveView inherits Rectangle {
                                         alignment: start;
                                         Text { text: "SHOPPING · \"\{VS.products-query}\" · \{VS.products.length} stores"; color: VS.ink3; font-size: 11px; }
                                         // big cards like the images: large photo on top, details below (≈1 in view, scroll for more)
-                                        for p in VS.products: Rectangle {
+                                        for p[i] in VS.products: Rectangle {
                                             height: 268px;
                                             border-radius: VS.radius-sm;
                                             background: VS.card;
@@ -828,7 +833,7 @@ component ActiveView inherits Rectangle {
                                                     if p.failed: Text {
                                                         x: 0; width: 100%;
                                                         y: parent.height / 2 + 16px;
-                                                        text: "couldn't load";
+                                                        text: "couldn't load · tap to retry";
                                                         color: #ffffffcc;
                                                         font-size: 11px;
                                                         horizontal-alignment: center;
@@ -859,16 +864,19 @@ component ActiveView inherits Rectangle {
                                                     }
                                                 }
                                             }
-                                            // tap the card → open the in-app detail sheet (stay in the app)
+                                            // tap: retry a failed thumbnail, else open the in-app detail sheet
                                             TouchArea { clicked => {
-                                                VS.pd-pic = p.pic;
-                                                VS.pd-name = p.name;
-                                                VS.pd-price = p.price;
-                                                VS.pd-store = p.store;
-                                                VS.pd-rating = p.rating;
-                                                VS.pd-ships = p.ships;
-                                                VS.pd-link = p.link;
-                                                VS.pd-open = true;
+                                                if (p.failed) { root.retry-product(i); }
+                                                else {
+                                                    VS.pd-pic = p.pic;
+                                                    VS.pd-name = p.name;
+                                                    VS.pd-price = p.price;
+                                                    VS.pd-store = p.store;
+                                                    VS.pd-rating = p.rating;
+                                                    VS.pd-ships = p.ships;
+                                                    VS.pd-link = p.link;
+                                                    VS.pd-open = true;
+                                                }
                                             } }
                                         }
                                     }
@@ -1051,6 +1059,8 @@ export component MainWindow inherits Window {
     // region reported here, and hides it when the map view is no longer active.
     callback report-map-geom(length, length, length, length); // absolute x, y, w, h
     callback map-active-changed(bool);
+    callback retry-image(int);   // re-fetch a failed image thumbnail
+    callback retry-product(int); // re-fetch a failed product thumbnail
     property <bool> map-active: VS.current-view == "map";
     changed map-active => { self.map-active-changed(self.map-active); }
 
@@ -1342,7 +1352,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } }
+                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } }
                             if VS.rail-pos == "right": SwitcherRail {
                                 on-left: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
@@ -1361,7 +1371,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } }
+                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } }
                             if VS.rail-pos == "bottom": SwitcherRailH {
                                 drop-down: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
