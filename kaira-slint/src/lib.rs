@@ -80,13 +80,14 @@ use tts::{
 fn icon_for(id: &str) -> &'static str {
     match id {
         "chat" => "💬", "images" => "🖼", "web" => "🌐",
-        "map" => "📍", "products" => "🛍", "docs" => "📄", "videos" => "🎬", _ => "•",
+        "map" => "📍", "products" => "🛍", "docs" => "📄", "videos" => "🎬", "weather" => "🌤", _ => "•",
     }
 }
 fn label_for(id: &str) -> &'static str {
     match id {
         "chat" => "Chat", "images" => "Images", "web" => "Web",
-        "map" => "Map", "products" => "Shopping", "docs" => "Documents", "videos" => "Videos", _ => "View",
+        "map" => "Map", "products" => "Shopping", "docs" => "Documents", "videos" => "Videos",
+        "weather" => "Weather", _ => "View",
     }
 }
 fn tab_for(id: &str) -> ViewTab {
@@ -646,6 +647,21 @@ fn sync_images(ui: &MainWindow) {
 
 /// Push VS.video-* (count, titles, active index, active grid) from the batch history, and
 /// (re)start the thumbnail fetches for the active batch. Mirrors `sync_images`.
+/// The clean, always-public YouTube thumbnail for a video id — immune to the signed,
+/// hotlink-protected (WebP-serving) URLs older bot builds / persisted history stored. Falls
+/// back to the stored URL only if there's no usable id.
+fn yt_thumb(vid: &str, stored: &str) -> String {
+    let v: String = vid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if v.is_empty() {
+        stored.to_string()
+    } else {
+        format!("https://i.ytimg.com/vi/{v}/hqdefault.jpg")
+    }
+}
+
 fn sync_videos(ui: &MainWindow) {
     let vs = ui.global::<VS>();
     let (query, thumbs) = VIDEO_TABS.with(|tabs| {
@@ -668,13 +684,13 @@ fn sync_videos(ui: &MainWindow) {
                         channel: d.channel.as_str().into(),
                         dur: d.dur.as_str().into(),
                         url: d.url.as_str().into(),
-                        thumb: d.thumb.as_str().into(),
+                        thumb: yt_thumb(&d.vid, &d.thumb).as_str().into(),
                         tint: tint(i),
                         pic: Default::default(),
                         failed: false,
                     })
                     .collect();
-                let thumbs: Vec<String> = b.items.iter().map(|d| d.thumb.clone()).collect();
+                let thumbs: Vec<String> = b.items.iter().map(|d| yt_thumb(&d.vid, &d.thumb)).collect();
                 vs.set_videos(ModelRc::from(Rc::new(VecModel::from(items))));
                 (b.query.clone(), thumbs)
             }
@@ -1004,6 +1020,51 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
             vs.set_doc_name(sget("name").into());
             vs.set_doc_page(sget("page").into());
             switch(ui, "docs", false);
+        }
+        "weather" => {
+            let hours: Vec<WeatherHour> = v
+                .get("hours")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|it| {
+                            let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                            WeatherHour { time: g("t").into(), temp: g("temp").into(), icon: g("icon").into() }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let days: Vec<WeatherDay> = v
+                .get("days")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|it| {
+                            let g = |k: &str| it.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                            WeatherDay {
+                                day: g("d").into(),
+                                hi: g("hi").into(),
+                                lo: g("lo").into(),
+                                icon: g("icon").into(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            vs.set_weather_place(sget("place").into());
+            vs.set_weather_temp(sget("temp").into());
+            vs.set_weather_cond(sget("cond").into());
+            vs.set_weather_icon(sget("icon").into());
+            vs.set_weather_feels(sget("feels").into());
+            vs.set_weather_hi(sget("hi").into());
+            vs.set_weather_lo(sget("lo").into());
+            vs.set_weather_humidity(sget("humidity").into());
+            vs.set_weather_wind(sget("wind").into());
+            vs.set_weather_day(bget("is_day", true));
+            vs.set_weather_hours(ModelRc::from(Rc::new(VecModel::from(hours))));
+            vs.set_weather_days(ModelRc::from(Rc::new(VecModel::from(days))));
+            vs.set_weather_ok(true);
+            switch(ui, "weather", true);
         }
         // Nova signals she's running a slow tool for `view`: show a "working" pill there until
         // the matching content op lands (which clears it via `switch`). Optional `label`.

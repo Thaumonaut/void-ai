@@ -80,6 +80,20 @@ class UiBridge:
         # items: [{title, channel, dur, url, id, thumb}] — a grid whose items play in a WKWebView.
         await self._send("videos", items=items, query=query, collapse=collapse)
 
+    async def weather(
+        self, place: str, temp: str, cond: str, icon: str,
+        feels: Optional[str] = None, hi: Optional[str] = None, lo: Optional[str] = None,
+        humidity: Optional[str] = None, wind: Optional[str] = None, is_day: bool = True,
+        hours: Optional[list] = None, days: Optional[list] = None, collapse: bool = True,
+    ) -> None:
+        # All display values are pre-formatted strings ("62°", "8 mph"); icon is a condition id
+        # (clear-day/clear-night/partly/cloudy/rain/snow/storm/fog). hours/days carry per-item icons.
+        await self._send(
+            "weather", place=place, temp=temp, cond=cond, icon=icon, feels=feels,
+            hi=hi, lo=lo, humidity=humidity, wind=wind, is_day=is_day,
+            hours=hours, days=days, collapse=collapse,
+        )
+
     async def web(
         self, url: str, title: Optional[str] = None, blocks: Optional[list] = None,
         tabs: Optional[list] = None, active: Optional[int] = None, collapse: bool = False,

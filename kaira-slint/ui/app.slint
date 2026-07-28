@@ -18,6 +18,9 @@ export struct Block { kind: string, text: string }   // web/doc: kind = "h"|"p"|
 // A chat entry: normally a spoken turn (kind==""), but Nova's tool results drop a tappable
 // result CARD into the timeline (kind = "images"|"web"|"videos"); tapping jumps to that view+tab.
 export struct ChatTurn { who: string, text: string, is-user: bool, kind: string, tab: int, sub: string }
+// weather: `icon` is a condition id (clear-day · clear-night · partly · cloudy · rain · snow · storm · fog)
+export struct WeatherHour { time: string, temp: string, icon: string }
+export struct WeatherDay { day: string, hi: string, lo: string, icon: string }
 
 // Theme + view state + content models. Rust drives these from UiControlCb; the UI
 // reads them directly. See UI_CONTRACT.md.
@@ -117,6 +120,20 @@ export global VS {
     in-out property <string> doc-name;
     in-out property <string> doc-page;
     in-out property <[Block]> doc-blocks;
+    // weather (all values pre-formatted for display by the bot: "62°", "8 mph", "72%")
+    in-out property <bool> weather-ok;          // has data (else the empty state)
+    in-out property <string> weather-place;
+    in-out property <string> weather-temp;
+    in-out property <string> weather-cond;
+    in-out property <string> weather-icon;      // condition id → Ico.wx()
+    in-out property <string> weather-feels;
+    in-out property <string> weather-hi;
+    in-out property <string> weather-lo;
+    in-out property <string> weather-humidity;
+    in-out property <string> weather-wind;
+    in-out property <bool> weather-day;
+    in-out property <[WeatherHour]> weather-hours;
+    in-out property <[WeatherDay]> weather-days;
 
     // --- transient tool state ---
     // which view Nova is actively fetching for ("" = none); shows a "working" pill until content lands.
@@ -196,6 +213,13 @@ export global Ico {
     out property <string> chev-down: "M6 9 L12 15 L18 9";
     out property <string> mic: "M12 3 A3 3 0 0 0 9 6 V11 A3 3 0 0 0 15 11 V6 A3 3 0 0 0 12 3 Z M6 11 A6 6 0 0 0 18 11 M12 17 V21 M9 21 H15";
     out property <string> power: "M12 3 V11 M7.5 6.3 A6.5 6.5 0 1 0 16.5 6.3";
+    // weather condition glyphs (clear reuses sun/moon)
+    out property <string> wx-cloud: "M7 17.5 A3.8 3.8 0 0 1 7 10 A5 5 0 0 1 16.5 10.6 A3.4 3.4 0 0 1 16.5 17.5 Z";
+    out property <string> wx-partly: "M7.5 8.5 A2.6 2.6 0 1 1 7.49 8.5 M7.5 3.4 V4.9 M3.4 8.5 H1.9 M4.2 5.2 L5.2 6.2 M10.8 5.2 L9.8 6.2 M9 18.5 A3.6 3.6 0 0 1 9 11.5 A4.8 4.8 0 0 1 18 12 A3.2 3.2 0 0 1 18 18.5 Z";
+    out property <string> wx-rain: "M6.5 14.5 A3.8 3.8 0 0 1 6.5 7 A5 5 0 0 1 16 7.6 A3.4 3.4 0 0 1 16 14.5 Z M8 17 L7 19.5 M12 17 L11 19.5 M15.5 17 L14.5 19.5";
+    out property <string> wx-snow: "M6.5 14.5 A3.8 3.8 0 0 1 6.5 7 A5 5 0 0 1 16 7.6 A3.4 3.4 0 0 1 16 14.5 Z M8 17.5 V20 M6.8 18.7 H9.2 M12 17.5 V20 M10.8 18.7 H13.2 M15.5 17.5 V20 M14.3 18.7 H16.7";
+    out property <string> wx-storm: "M6.5 14.5 A3.8 3.8 0 0 1 6.5 7 A5 5 0 0 1 16 7.6 A3.4 3.4 0 0 1 16 14.5 Z M12.5 15.5 L9.5 20 H12 L10 23.5";
+    out property <string> wx-fog: "M4 9 H20 M4 13 H20 M6 17 H18";
 
     pure public function path(id: string) -> string {
         return id == "images" ? images
@@ -204,7 +228,29 @@ export global Ico {
             : id == "map" ? map
             : id == "products" ? shop
             : id == "docs" ? docs
+            : id == "weather" ? wx-partly
             : chat;
+    }
+    // Map a weather condition id → its glyph + a condition tint.
+    pure public function wx(id: string) -> string {
+        return id == "clear-day" ? sun
+            : id == "clear-night" ? moon
+            : id == "partly" ? wx-partly
+            : id == "cloudy" ? wx-cloud
+            : id == "rain" ? wx-rain
+            : id == "snow" ? wx-snow
+            : id == "storm" ? wx-storm
+            : id == "fog" ? wx-fog
+            : wx-partly;
+    }
+    pure public function wx-tint(id: string) -> color {
+        return id == "clear-day" ? #f5a623
+            : id == "clear-night" ? #9aa0c8
+            : id == "partly" ? #f5a623
+            : id == "rain" ? #4a9fe0
+            : id == "snow" ? #7fc4ea
+            : id == "storm" ? #f5a623
+            : #8a90a5;   // cloudy / fog / default
     }
 }
 
@@ -1693,6 +1739,115 @@ component ActiveView inherits Rectangle {
                                         }
                                     }
                                 }
+
+                                // -- weather --
+                                if VS.current-view == "weather" && VS.working-view == "weather": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "weather" && !VS.weather-ok && VS.working-view != "weather": EmptyState {
+                                    icon-d: Ico.wx-partly; hint: "Ask about the weather.";
+                                }
+                                if VS.current-view == "weather" && VS.weather-ok && VS.working-view != "weather": Flickable {
+                                    viewport-width: self.width;
+                                    viewport-height: wcol.preferred-height;
+                                    wcol := VerticalLayout {
+                                        width: parent.width;
+                                        padding: VS.gut;
+                                        spacing: VS.gap;
+                                        alignment: start;
+                                        // ---- current conditions ----
+                                        Text {
+                                            text: VS.weather-place;
+                                            color: VS.ink3; font-size: 12px; font-weight: 700; letter-spacing: 0.6px;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 14px;
+                                            Rectangle {
+                                                width: 72px; height: 72px;
+                                                Icon {
+                                                    width: 58px; height: 58px;
+                                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                                    d: Ico.wx(VS.weather-icon); ink: Ico.wx-tint(VS.weather-icon); sw: 1.6px;
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                horizontal-stretch: 1; alignment: center; spacing: 2px;
+                                                Text { text: VS.weather-temp; color: VS.ink; font-size: 46px; font-weight: 800; }
+                                                Text { text: VS.weather-cond; color: VS.ink2; font-size: 14px; }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center; spacing: 5px;
+                                                Text { text: "H \{VS.weather-hi}   L \{VS.weather-lo}"; color: VS.ink2; font-size: 13px; horizontal-alignment: right; }
+                                                Text { text: "Feels \{VS.weather-feels}"; color: VS.ink3; font-size: 12px; horizontal-alignment: right; }
+                                            }
+                                        }
+                                        // ---- detail stats ----
+                                        HorizontalLayout {
+                                            spacing: VS.gap-sm;
+                                            for s in [
+                                                { k: "HUMIDITY", v: VS.weather-humidity },
+                                                { k: "WIND", v: VS.weather-wind },
+                                            ]: Rectangle {
+                                                horizontal-stretch: 1; height: 62px; border-radius: VS.radius-sm;
+                                                background: VS.card; border-width: 1px; border-color: VS.cardline;
+                                                VerticalLayout {
+                                                    alignment: center; spacing: 3px;
+                                                    Text { text: s.k; color: VS.ink3; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; horizontal-alignment: center; }
+                                                    Text { text: s.v; color: VS.ink; font-size: 18px; font-weight: 700; horizontal-alignment: center; }
+                                                }
+                                            }
+                                        }
+                                        // ---- hourly ----
+                                        if VS.weather-hours.length > 0: Text {
+                                            text: "HOURLY"; color: VS.ink3; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+                                        }
+                                        if VS.weather-hours.length > 0: Flickable {
+                                            height: 96px;
+                                            viewport-height: 96px;
+                                            viewport-width: hrow.preferred-width;
+                                            hrow := HorizontalLayout {
+                                                height: 96px;
+                                                spacing: 6px;
+                                                for h in VS.weather-hours: Rectangle {
+                                                    width: 58px;
+                                                    border-radius: VS.radius-sm;
+                                                    background: VS.card; border-width: 1px; border-color: VS.cardline;
+                                                    VerticalLayout {
+                                                        padding-top: 11px; padding-bottom: 11px; spacing: 5px; alignment: center;
+                                                        Text { text: h.time; color: VS.ink3; font-size: 11px; horizontal-alignment: center; }
+                                                        Rectangle {
+                                                            height: 26px;
+                                                            Icon { width: 24px; height: 24px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.wx(h.icon); ink: Ico.wx-tint(h.icon); sw: 1.6px; }
+                                                        }
+                                                        Text { text: h.temp; color: VS.ink; font-size: 14px; font-weight: 700; horizontal-alignment: center; }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // ---- daily ----
+                                        if VS.weather-days.length > 0: Text {
+                                            text: "\{VS.weather-days.length}-DAY FORECAST"; color: VS.ink3; font-size: 11px; font-weight: 700; letter-spacing: 1px;
+                                        }
+                                        if VS.weather-days.length > 0: VerticalLayout {
+                                            alignment: start;
+                                            for d in VS.weather-days: Rectangle {
+                                                height: 46px;
+                                                Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.cardline; }
+                                                HorizontalLayout {
+                                                    spacing: VS.gap-sm;
+                                                    Text { text: d.day; color: VS.ink; font-size: 13px; width: 68px; vertical-alignment: center; }
+                                                    Rectangle {
+                                                        width: 30px;
+                                                        Icon { width: 22px; height: 22px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.wx(d.icon); ink: Ico.wx-tint(d.icon); sw: 1.6px; }
+                                                    }
+                                                    Rectangle { horizontal-stretch: 1; }
+                                                    Text { text: d.lo; color: VS.ink3; font-size: 13px; vertical-alignment: center; }
+                                                    Text { text: d.hi; color: VS.ink; font-size: 13px; font-weight: 700; width: 44px; horizontal-alignment: right; vertical-alignment: center; }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
 }
 
 export component MainWindow inherits Window {
@@ -2558,6 +2713,7 @@ export component MainWindow inherits Window {
                                 { id: "web", label: "Web" },
                                 { id: "map", label: "Map" },
                                 { id: "products", label: "Shopping" },
+                                { id: "weather", label: "Weather" },
                                 { id: "docs", label: "Documents" },
                             ]: Rectangle {
                                 height: 52px;

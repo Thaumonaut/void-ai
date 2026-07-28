@@ -41,31 +41,35 @@ fn host_view(window: &slint::Window) -> Option<*mut AnyObject> {
 /// Start playing the YouTube video `vid` (its 11-char id). Buffered until the player region
 /// reports its geometry; the actual load happens in `show_at`.
 pub fn play(vid: &str) {
+    // Sanitize to a bare YouTube id (safe to inline into the player JS below).
+    let vid: String = vid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
     if vid.is_empty() {
         return;
     }
-    let url = format!(
-        "https://www.youtube.com/embed/{vid}?playsinline=1&autoplay=1&rel=0&modestbranding=1"
-    );
-    PENDING_URL.with(|p| *p.borrow_mut() = Some(url));
+    PENDING_URL.with(|p| *p.borrow_mut() = Some(vid));
     apply_pending();
 }
 
-/// Load the YouTube embed via an `<iframe>` on a page with a REAL https origin (`baseURL`).
-/// Navigating straight to the embed URL from an `about:blank` page gives a null origin, which
-/// YouTube's player rejects ("config error / won't play"); a real baseURL makes the embed's
-/// referrer valid. We use `loadHTMLString:` (the proven WKWebView path — hand-rolling an
-/// NSURLRequest tripped objc2's msg_send verification → SIGABRT).
-unsafe fn load_html_redirect(webview: &AnyObject, url: &str) {
-    let esc = url.replace('&', "&amp;").replace('"', "&quot;");
+/// Load the YouTube **IFrame Player API** on a page with a real origin (`baseURL`), passing a
+/// matching `origin` playerVar — the approach Google's own iOS helper uses. A raw `/embed/`
+/// navigation (or a bare `<iframe>`) from an about:blank page gives a null/foreign origin the
+/// player rejects ("config error"). `loadHTMLString:` is the proven WKWebView path (hand-rolling
+/// an NSURLRequest tripped objc2's msg_send verification → SIGABRT).
+unsafe fn load_youtube_player(webview: &AnyObject, vid: &str) {
     let html = format!(
         "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>\
-         <style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}\
-         iframe{{border:0;position:absolute;inset:0;width:100%;height:100%}}</style></head>\
-         <body><iframe src=\"{esc}\" allow='autoplay;encrypted-media;picture-in-picture' allowfullscreen></iframe></body></html>"
+         <style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}#p{{position:absolute;inset:0}}</style>\
+         </head><body><div id='p'></div>\
+         <script src='https://www.youtube.com/iframe_api'></script>\
+         <script>function onYouTubeIframeAPIReady(){{new YT.Player('p',{{height:'100%',width:'100%',videoId:'{vid}',\
+         playerVars:{{playsinline:1,autoplay:1,rel:0,modestbranding:1,origin:'https://kaira.local'}},\
+         events:{{onReady:function(e){{e.target.playVideo();}}}}}});}}</script></body></html>"
     );
     let html_ns = NSString::from_str(&html);
-    let base = NSString::from_str("https://www.youtube.com/");
+    let base = NSString::from_str("https://kaira.local/");
     if let Some(base_url) = NSURL::URLWithString(&base) {
         // loadHTMLString:baseURL: returns WKNavigation* — declare the object return (matches
         // ios_map); declaring `()` mismatches the encoding and objc2 aborts.
@@ -79,13 +83,13 @@ fn apply_pending() {
             let m = m.borrow();
             let Some(wv) = m.as_ref() else { return };
             PENDING_URL.with(|p| {
-                let Some(url) = p.borrow().clone() else { return };
-                let already = LOADED_URL.with(|l| l.borrow().as_deref() == Some(url.as_str()));
+                let Some(vid) = p.borrow().clone() else { return };
+                let already = LOADED_URL.with(|l| l.borrow().as_deref() == Some(vid.as_str()));
                 if already {
                     return;
                 }
-                load_html_redirect(&**wv, &url);
-                LOADED_URL.with(|l| *l.borrow_mut() = Some(url));
+                load_youtube_player(&**wv, &vid);
+                LOADED_URL.with(|l| *l.borrow_mut() = Some(vid));
             });
         });
     }

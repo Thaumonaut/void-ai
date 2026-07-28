@@ -14,8 +14,8 @@ The client already routes by `label == "rtvi-ai"` then `type`. We add two `type`
 `server-message` (Nova → client, UI control) and `client-message` (client → Nova, context).
 Existing `user-transcription` / `bot-transcription` are unchanged.
 
-**Views** are identified by these ids: `chat` · `images` · `web` · `map` · `products` · `docs`.
-(`chat` is permanent and cannot be closed.)
+**Views** are identified by these ids: `chat` · `images` · `web` · `map` · `products` · `docs` ·
+`videos` · `weather`. (`chat` is permanent and cannot be closed.)
 
 Keep payloads small — the target runs on spotty 3G. Images/thumbnails are URLs the
 client fetches lazily (placeholder while loading); `web`/`doc` blocks are pre-simplified
@@ -58,6 +58,14 @@ server-side, never raw HTML.
 
 { "op":"doc",      "name":"Report.pdf", "page?":"1 / 12", "collapse?":false,
   "blocks":[ {"h2":"Title"}, {"p":"…"}, {"rule":true} ] }
+
+{ "op":"weather",  "place":"Seattle, WA", "temp":"62°", "cond":"Partly cloudy",
+  "icon":"partly", "feels":"60°", "hi":"68°", "lo":"54°", "humidity":"72%",
+  "wind":"8 mph", "is_day":true, "collapse?":true,
+  // all values are pre-formatted display strings; `icon` is a condition id:
+  //   clear-day · clear-night · partly · cloudy · rain · snow · storm · fog
+  "hours":[ { "t":"3 PM", "temp":"63°", "icon":"partly" } ],
+  "days":[  { "d":"Today", "hi":"68°", "lo":"54°", "icon":"partly" } ] }
 ```
 
 Sent from the bot via `UiBridge` (see `ui.py`), e.g. `await ui.map(pins, query=…)`.
