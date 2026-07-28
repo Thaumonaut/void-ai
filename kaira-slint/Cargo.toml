@@ -66,7 +66,11 @@ webrtc = "0.17"
 # suppression — replaces cpal+rodio on iOS so a background fan doesn't swamp the VAD.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
-objc2-avf-audio = { version = "0.3", features = ["AVAudioSession"] }
+# AVAudioSessionTypes + block2 unlock recordPermission()/requestRecordPermission: — the
+# in-app mic permission check + prompt (see src/permissions.rs).
+objc2-avf-audio = { version = "0.3", features = ["AVAudioSession", "AVAudioSessionTypes", "block2"] }
+# The ObjC completion block passed to requestRecordPermission:.
+block2 = "0.6"
 coreaudio-sys = { version = "0.2.18", features = ["audio_unit", "audio_toolbox", "core_audio"] }
 # CoreLocation (CLLocationManager) → the phone's GPS, sent to the bot so directions start
 # from where the user is (mirrors the Android LocationManager path in native_stt).

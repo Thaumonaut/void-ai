@@ -11,10 +11,13 @@ export struct TtsRow { engine: string, meta: string }
 // ==== VOID_AI dynamic view surface (driven by Nova over the UI-control channel) ====
 export struct ViewTab { id: string, label: string, icon: string }
 export struct ImageItem { cap: string, url: string, tint: color, pic: image, failed: bool }
+export struct VideoItem { title: string, channel: string, dur: string, url: string, thumb: string, tint: color, pic: image, failed: bool }
 export struct MapPin { name: string, note: string, dist: string, rating: string, x: float, y: float, lat: float, lng: float }
 export struct Product { name: string, price: string, store: string, rating: string, ships: string, link: string, tint: color, pic: image, failed: bool, thumb: string }
 export struct Block { kind: string, text: string }   // web/doc: kind = "h"|"p"|"h2"|"rule"
-export struct ChatTurn { who: string, text: string, is-user: bool }
+// A chat entry: normally a spoken turn (kind==""), but Nova's tool results drop a tappable
+// result CARD into the timeline (kind = "images"|"web"|"videos"); tapping jumps to that view+tab.
+export struct ChatTurn { who: string, text: string, is-user: bool, kind: string, tab: int, sub: string }
 
 // Theme + view state + content models. Rust drives these from UiControlCb; the UI
 // reads them directly. See UI_CONTRACT.md.
@@ -68,11 +71,21 @@ export global VS {
     // --- settings ---
     in-out property <string> rail-pos: "right";   // which side the view-switcher rail sits on: "left" | "right"
     in-out property <bool> settings-open: false;   // the settings sheet (opened from the gear)
+    in-out property <bool> addmenu-open: false;    // the "add a view" sheet (opened from the + button)
+
+    // --- onboarding + permissions (see src/permissions.rs) ---
+    in-out property <bool> onboarding-open: false;  // first-run intro + permission-priming overlay
+    // OS permission state, mirrored from Rust: 0 = undetermined, 1 = granted, 2 = denied/blocked.
+    in-out property <int> mic-perm: 0;
+    in-out property <int> loc-perm: 0;
 
     // --- content (populated by Nova's tools / live transcript) ---
     in-out property <[ChatTurn]> chat-turns;
     in-out property <string> images-query;
     in-out property <[ImageItem]> images;
+    in-out property <int> image-tabs;           // number of image searches kept in history
+    in-out property <[string]> image-tab-titles; // the query for each search (the tab switcher)
+    in-out property <int> image-active-tab;     // index of the batch currently shown
     in-out property <string> map-query;
     in-out property <image> map-image;
     in-out property <[MapPin]> pins;
@@ -85,7 +98,19 @@ export global VS {
     in-out property <int> web-tabs;          // number of open web tabs (managed in Rust)
     in-out property <[string]> web-tab-titles; // titles for the tab switcher
     in-out property <int> web-active-tab;    // index of the active tab
-    in-out property <[Block]> web-blocks;    // blocks of the ACTIVE tab
+    in-out property <[Block]> web-blocks;    // blocks of the ACTIVE tab (Nova's summary)
+    in-out property <bool> has-web-reader;   // iOS: a real WKWebView backs the web view
+    in-out property <bool> web-take-open;    // showing Nova's summary instead of the live page
+    in-out property <bool> web-tabsw-open;   // web tab-switcher overlay open
+    in-out property <bool> web-menu-open;    // web kebab menu overlay open
+    in-out property <string> videos-query;
+    in-out property <[VideoItem]> videos;       // results in the ACTIVE video search
+    in-out property <int> video-tabs;           // number of video searches in history
+    in-out property <[string]> video-tab-titles;
+    in-out property <int> video-active-tab;
+    in-out property <string> playing-video-id;   // "" = results grid; else the YouTube id playing
+    in-out property <string> playing-video-title;
+    in-out property <string> playing-video-url;  // watch URL (for "open in YouTube")
     in-out property <string> doc-name;
     in-out property <string> doc-page;
     in-out property <[Block]> doc-blocks;
@@ -101,7 +126,13 @@ export global VS {
     callback close-view(string);  // close a view (never chat)
     callback switch-web-tab(int); // make web tab N the active one
     callback close-web-tab(int);  // close web tab N
+    callback switch-image-tab(int); // show image search N from the history
     callback open-web-external(); // open the active tab's URL in the phone browser
+    callback chat-jump(string, int); // tap a chat result card → switch to view `kind`, tab N
+    callback switch-video-tab(int); // show video search N from the history
+    callback play-video(int);       // play result N of the active video search
+    callback close-video-player();  // stop playback, back to the results grid
+    callback open-video-external(); // open the playing video in YouTube / the browser
 }
 
 // ---- design system: premium cosmic palette, keyed off the constellation logo ----
@@ -134,6 +165,14 @@ export global Persona {
     out property <color> accent: index == 1 ? #35b27a : Pal.violet;  // Kaira green · Nova violet
 }
 
+// Voice-pipeline A/B: cascade (Soniox STT → LLM → Soniox TTS) vs duplex (Gemini Live S2S).
+// Passed to the bot as ?mode= on connect, overriding that bot's env default per session.
+export global Engine {
+    in-out property <int> index: 0;                                  // 0 = Cascade · 1 = Duplex
+    out property <string> id: index == 1 ? "duplex" : "cascade";
+    out property <string> name: index == 1 ? "Duplex" : "Cascade";
+}
+
 // Clean line icons (24×24 viewbox) so we're not shipping emoji.
 export global Ico {
     out property <string> sun: "M12 8 A4 4 0 1 1 11.99 8 M12 1.5 V4 M12 20 V22.5 M4 4 L5.7 5.7 M18.3 18.3 L20 20 M1.5 12 H4 M20 12 H22.5 M4 20 L5.7 18.3 M18.3 5.7 L20 4";
@@ -142,6 +181,7 @@ export global Ico {
     out property <string> chat: "M4 6 H17 A3 3 0 0 1 20 9 V13 A3 3 0 0 1 17 16 H10 L6 19 V16 H4 A2 2 0 0 1 2 14 V8 A2 2 0 0 1 4 6 Z";
     out property <string> images: "M3 4 H21 V20 H3 Z M8.5 9.5 A1.8 1.8 0 1 1 8.49 9.5 M21 16 L16 11 L7 20";
     out property <string> web: "M12 3 A9 9 0 1 1 11.99 3 M3 12 H21 M12 3 C14.6 5.7 14.6 18.3 12 21 M12 3 C9.4 5.7 9.4 18.3 12 21";
+    out property <string> video: "M3 6 A2 2 0 0 1 5 4 H19 A2 2 0 0 1 21 6 V18 A2 2 0 0 1 19 20 H5 A2 2 0 0 1 3 18 Z M10 9 L15 12 L10 15 Z";
     out property <string> map: "M12 21 C12 21 19 14.8 19 9 A7 7 0 0 0 5 9 C5 14.8 12 21 12 21 Z M12 9 A2.6 2.6 0 1 1 11.99 9";
     out property <string> shop: "M4 5 H6 L8.4 16 H18 L20.4 8 H7 M9.5 20 A1.2 1.2 0 1 1 9.49 20 M16.5 20 A1.2 1.2 0 1 1 16.49 20";
     out property <string> docs: "M14 3 H7 A2 2 0 0 0 5 5 V19 A2 2 0 0 0 7 21 H17 A2 2 0 0 0 19 19 V8 Z M14 3 V8 H19 M9 13 H15 M9 17 H14";
@@ -242,6 +282,33 @@ component WorkingPill inherits Rectangle {
             color: VS.ink3;
             font-size: 14px;
             horizontal-alignment: center;
+        }
+    }
+}
+
+// Shown inside the waveform pill when the conversation is paused (mic muted): a calm row of dim
+// bars breathing in place — reads unmistakably as "paused / standby", distinct from the live
+// scrolling waveform. Tap the pill to resume.
+component PausedWave inherits Rectangle {
+    property <bool> breathe: false;
+    Timer {
+        interval: 640ms;
+        running: true;
+        triggered => { root.breathe = !root.breathe; }
+    }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 4px;
+        for i in 5: Rectangle {
+            width: 4px;
+            Rectangle {
+                width: 4px;
+                border-radius: 2px;
+                height: root.breathe ? 15px : 6px;
+                y: (parent.height - self.height) / 2;
+                background: #b3b9c8;
+                animate height { duration: 560ms; easing: ease-in-out; delay: i * 80ms; }
+            }
         }
     }
 }
@@ -468,49 +535,9 @@ component SwitcherRail inherits VerticalLayout {
         SwitchBtn {
             d: Ico.plus;
             dashed: true;
-            tapped => { addmenu.show(); }
-        }
-        addmenu := PopupWindow {
-            x: root.on-left ? 52px : -164px;
-            y: -318px;
-            width: 212px;
-            height: 310px;
-            Rectangle {
-                width: 100%;
-                height: 100%;
-                background: VS.card;
-                border-radius: 14px;
-                border-width: 1px;
-                border-color: VS.line;
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 2px;
-                    alignment: start;
-                    for v in [
-                        { id: "chat", label: "Chat" },
-                        { id: "images", label: "Images" },
-                        { id: "web", label: "Web" },
-                        { id: "map", label: "Map" },
-                        { id: "products", label: "Shopping" },
-                        { id: "docs", label: "Documents" },
-                    ]: Rectangle {
-                        height: 48px;
-                        border-radius: 10px;
-                        background: item-ta.pressed ? VS.url-bg : transparent;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 10px;
-                            spacing: 13px;
-                            Rectangle {
-                                width: 20px;
-                                Icon { width: 18px; height: 18px; x: 0; y: (parent.height - self.height) / 2; d: Ico.path(v.id); ink: VS.ink2; sw: 1.8px; }
-                            }
-                            Text { text: v.label; color: VS.ink; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
-                        }
-                        item-ta := TouchArea { clicked => { VS.add-view(v.id); } }
-                    }
-                }
-            }
+            // opens a root-level overlay (not a PopupWindow) so it's never covered by the
+            // native map webview on iOS. See the "add a view" sheet in MainWindow.
+            tapped => { VS.addmenu-open = true; }
         }
     }
 }
@@ -569,49 +596,7 @@ component SwitcherRailH inherits HorizontalLayout {
         SwitchBtn {
             d: Ico.plus;
             dashed: true;
-            tapped => { addmenuh.show(); }
-        }
-        addmenuh := PopupWindow {
-            x: -82px;                                  // center the 212px menu over the 48px + button
-            y: root.drop-down ? 52px : -318px;
-            width: 212px;
-            height: 310px;
-            Rectangle {
-                width: 100%;
-                height: 100%;
-                background: VS.card;
-                border-radius: 14px;
-                border-width: 1px;
-                border-color: VS.line;
-                VerticalLayout {
-                    padding: 6px;
-                    spacing: 2px;
-                    alignment: start;
-                    for v in [
-                        { id: "chat", label: "Chat" },
-                        { id: "images", label: "Images" },
-                        { id: "web", label: "Web" },
-                        { id: "map", label: "Map" },
-                        { id: "products", label: "Shopping" },
-                        { id: "docs", label: "Documents" },
-                    ]: Rectangle {
-                        height: 48px;
-                        border-radius: 10px;
-                        background: itemh-ta.pressed ? VS.url-bg : transparent;
-                        HorizontalLayout {
-                            padding-left: 14px;
-                            padding-right: 10px;
-                            spacing: 13px;
-                            Rectangle {
-                                width: 20px;
-                                Icon { width: 18px; height: 18px; x: 0; y: (parent.height - self.height) / 2; d: Ico.path(v.id); ink: VS.ink2; sw: 1.8px; }
-                            }
-                            Text { text: v.label; color: VS.ink; font-size: 14px; horizontal-stretch: 1; vertical-alignment: center; }
-                        }
-                        itemh-ta := TouchArea { clicked => { VS.add-view(v.id); } }
-                    }
-                }
-            }
+            tapped => { VS.addmenu-open = true; }
         }
     }
 }
@@ -622,6 +607,8 @@ component SwitcherRailH inherits HorizontalLayout {
 component ActiveView inherits Rectangle {
     callback open-url(string);
     callback report-map-geom(length, length, length, length);
+    callback report-web-geom(length, length, length, length);
+    callback report-video-geom(length, length, length, length);
     callback retry-image(int);
     callback retry-product(int);
     callback retry-map();
@@ -652,7 +639,8 @@ component ActiveView inherits Rectangle {
                                         for t in VS.chat-turns: VerticalLayout {
                                             spacing: 6px;
                                             alignment: start;
-                                            Text {
+                                            // -- a spoken turn --
+                                            if t.kind == "": Text {
                                                 text: t.is-user ? "YOU" : Persona.name-upper;
                                                 color: t.is-user ? VS.speaker-user : VS.orange;
                                                 font-family: "Figtree";
@@ -661,7 +649,7 @@ component ActiveView inherits Rectangle {
                                                 letter-spacing: 0.6px;
                                                 horizontal-alignment: left;
                                             }
-                                            Text {
+                                            if t.kind == "": Text {
                                                 text: t.text;
                                                 color: VS.ink;
                                                 font-family: "Figtree";
@@ -672,6 +660,63 @@ component ActiveView inherits Rectangle {
                                                 // message under-reports its height and the next turn overlaps it)
                                                 width: chat-col.width - VS.gut * 2;
                                                 horizontal-alignment: left;
+                                            }
+                                            // -- a tool-result card (tap to jump to that view + tab) --
+                                            if t.kind != "": Rectangle {
+                                                width: chat-col.width - VS.gut * 2;
+                                                height: 62px;
+                                                border-radius: 14px;
+                                                background: card-ta.pressed ? VS.line : VS.url-bg;
+                                                border-width: 1px;
+                                                border-color: VS.cardline;
+                                                HorizontalLayout {
+                                                    padding: 11px;
+                                                    spacing: 12px;
+                                                    Rectangle {
+                                                        width: 40px;
+                                                        y: (parent.height - self.height) / 2;
+                                                        height: 40px;
+                                                        border-radius: 10px;
+                                                        background: VS.orange.transparentize(0.86);
+                                                        Text {
+                                                            text: t.kind == "images" ? "🖼" : (t.kind == "videos" ? "🎬" : "🌐");
+                                                            font-size: 19px;
+                                                            horizontal-alignment: center;
+                                                            vertical-alignment: center;
+                                                            width: 100%;
+                                                            height: 100%;
+                                                        }
+                                                    }
+                                                    VerticalLayout {
+                                                        alignment: center;
+                                                        spacing: 2px;
+                                                        Text {
+                                                            text: t.text;
+                                                            color: VS.ink;
+                                                            font-family: "Figtree";
+                                                            font-size: 13.5px;
+                                                            font-weight: 700;
+                                                            overflow: elide;
+                                                            horizontal-alignment: left;
+                                                        }
+                                                        Text {
+                                                            text: t.sub;
+                                                            color: VS.ink3;
+                                                            font-family: "Figtree";
+                                                            font-size: 11.5px;
+                                                            overflow: elide;
+                                                            horizontal-alignment: left;
+                                                        }
+                                                    }
+                                                    Text {
+                                                        text: "\u{203a}";
+                                                        color: VS.ink3;
+                                                        font-size: 22px;
+                                                        vertical-alignment: center;
+                                                        width: 14px;
+                                                    }
+                                                }
+                                                card-ta := TouchArea { clicked => { VS.chat-jump(t.kind, t.tab); } }
                                             }
                                         }
                                     }
@@ -696,6 +741,34 @@ component ActiveView inherits Rectangle {
                                             text: "FOUND \{VS.images.length} · \"\{VS.images-query}\"";
                                             color: VS.ink3;
                                             font-size: 11px;
+                                        }
+                                        // Search history: one chip per past image search — tap to flip back.
+                                        if VS.image-tabs > 1: Flickable {
+                                            height: 30px;
+                                            viewport-width: itabrow.preferred-width;
+                                            viewport-height: 30px;
+                                            itabrow := HorizontalLayout {
+                                                spacing: 6px;
+                                                alignment: start;
+                                                for title[i] in VS.image-tab-titles: Rectangle {
+                                                    height: 28px;
+                                                    border-radius: 14px;
+                                                    background: i == VS.image-active-tab ? VS.orange : VS.url-bg;
+                                                    HorizontalLayout {
+                                                        padding-left: 12px;
+                                                        padding-right: 12px;
+                                                        Text {
+                                                            text: title;
+                                                            color: i == VS.image-active-tab ? white : VS.ink2;
+                                                            font-size: 12px;
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+                                                    TouchArea { clicked => { VS.switch-image-tab(i); } }
+                                                }
+                                            }
                                         }
                                         // full-width stacked photos
                                         for it[i] in VS.images: Rectangle {
@@ -746,32 +819,56 @@ component ActiveView inherits Rectangle {
                                 }
 
                                 // -- map --
-                                if VS.current-view == "map": VerticalLayout {
-                                    Rectangle {
-                                        height: 44px;
-                                        Icon {
-                                            x: 14px;
+                                if VS.current-view == "map": mapRoot := VerticalLayout {
+                                    // Draggable places sheet (peek / half / full). The map region below
+                                    // (mapArea, vertical-stretch) shrinks as the sheet grows, so on iOS the
+                                    // WKWebView positioned to mapArea never sits under the sheet — it just
+                                    // reframes via report-map-geom. No Rust change needed.
+                                    property <length> closed-h: 28px;   // fully closed → just a pull-tab; map gets the pane
+                                    property <length> peek-h: 120px;
+                                    property <length> half-h: mapRoot.height * 0.44;
+                                    property <length> full-h: mapRoot.height * 0.82;
+                                    property <length> sheet-h: 120px;
+                                    property <length> drag-start-h;
+                                    property <bool> dragging: false;
+                                    property <bool> route: VS.map-nav-url != "";
+                                    // query chip — a floating-looking pill instead of a full bar + divider
+                                    if VS.map-query != "": Rectangle {
+                                        height: 48px;
+                                        Rectangle {
+                                            x: VS.gut;
                                             y: (parent.height - self.height) / 2;
-                                            width: 15px;
-                                            height: 15px;
-                                            d: Ico.search;
-                                            ink: VS.ink3;
-                                            sw: 1.9px;
+                                            width: parent.width - VS.gut * 2;
+                                            height: 36px;
+                                            border-radius: 18px;
+                                            background: VS.url-bg;
+                                            border-width: 1px;
+                                            border-color: VS.cardline;
+                                            Icon {
+                                                x: 14px;
+                                                y: (parent.height - self.height) / 2;
+                                                width: 15px;
+                                                height: 15px;
+                                                d: Ico.search;
+                                                ink: VS.ink3;
+                                                sw: 1.9px;
+                                            }
+                                            Text {
+                                                x: 38px;
+                                                width: parent.width - 50px;
+                                                height: 100%;
+                                                vertical-alignment: center;
+                                                text: VS.map-query;
+                                                color: VS.ink2;
+                                                font-size: 12px;
+                                                overflow: elide;
+                                            }
                                         }
-                                        Text {
-                                            x: 38px;
-                                            height: 100%;
-                                            vertical-alignment: center;
-                                            text: VS.map-query;
-                                            color: VS.ink2;
-                                            font-size: 12px;
-                                        }
-                                        Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.line; }
                                     }
                                     mapArea := Rectangle {
                                         vertical-stretch: 1;
                                         clip: true;
-                                        background: #dbe4d6;
+                                        background: VS.dark ? #20242c : #dbe4d6;   // theme-aware fallback (was fixed light green)
                                         // On iOS the interactive Mapbox WKWebView is positioned to cover this
                                         // region (report-map-geom); the static tile below shows on other
                                         // platforms and as a fallback until the live map paints.
@@ -802,74 +899,136 @@ component ActiveView inherits Rectangle {
                                             TouchArea { clicked => { root.retry-map(); } }
                                         }
                                     }
-                                    // directions only: ETA + one-tap handoff to the phone's nav app,
-                                    // so you can study the route in-app first, then choose to navigate.
-                                    // directions: ETA on top, a FULL-WIDTH "Open in Maps" button below —
-                                    // stacked so the button never gets clipped on a narrow phone screen.
-                                    if VS.map-nav-url != "": Rectangle {
-                                        height: 96px;
+                                    // ---- draggable places sheet (closed / peek / half / full) ----
+                                    Rectangle {
+                                        height: mapRoot.sheet-h;
+                                        animate height { duration: mapRoot.dragging ? 0ms : 220ms; easing: ease-out; }
+                                        background: VS.card;
+                                        border-radius: VS.radius;
+                                        clip: true;   // collapse to the pull-tab hides the list cleanly
+                                        // top hairline separates the sheet from the map
+                                        Rectangle { y: 0; width: 100%; height: 1px; background: VS.cardline; }
                                         VerticalLayout {
-                                            padding-left: VS.gut;
-                                            padding-right: VS.gut;
-                                            padding-top: 10px;
-                                            padding-bottom: 12px;
-                                            spacing: 8px;
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                Text { text: VS.map-eta; color: VS.ink; font-size: 16px; font-weight: 800; vertical-alignment: center; }
-                                                Text { text: "route ready"; color: VS.ink3; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
-                                            }
+                                            spacing: 0;
+                                            // grab handle
                                             Rectangle {
-                                                vertical-stretch: 1;
-                                                border-radius: VS.radius;
-                                                background: nav-ta.pressed ? #c9401f : VS.orange;
-                                                HorizontalLayout {
-                                                    alignment: center;
+                                                height: 22px;
+                                                Rectangle {
+                                                    width: 40px;
+                                                    height: 5px;
+                                                    border-radius: 2.5px;
+                                                    background: VS.switchoff;
+                                                    x: (parent.width - self.width) / 2;
+                                                    y: 9px;
+                                                }
+                                            }
+                                            // directions active → ETA + one-tap handoff to the phone's nav app
+                                            if mapRoot.route: Rectangle {
+                                                height: 96px;
+                                                VerticalLayout {
+                                                    padding-left: VS.gut;
+                                                    padding-right: VS.gut;
+                                                    padding-top: 2px;
+                                                    padding-bottom: 12px;
                                                     spacing: 8px;
-                                                    Icon { width: 17px; height: 17px; y: (parent.height - self.height) / 2; d: Ico.map; ink: white; sw: 2px; }
-                                                    Text {
-                                                        vertical-alignment: center;
-                                                        text: "OPEN IN MAPS";
-                                                        color: white;
-                                                        font-size: 14px;
-                                                        font-weight: 700;
-                                                        letter-spacing: 1px;
+                                                    HorizontalLayout {
+                                                        spacing: 8px;
+                                                        Text { text: VS.map-eta; color: VS.ink; font-size: 16px; font-weight: 800; vertical-alignment: center; }
+                                                        Text { text: "route ready"; color: VS.ink3; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; }
+                                                    }
+                                                    Rectangle {
+                                                        vertical-stretch: 1;
+                                                        border-radius: VS.radius;
+                                                        background: nav-ta.pressed ? #c9401f : VS.orange;
+                                                        HorizontalLayout {
+                                                            alignment: center;
+                                                            spacing: 8px;
+                                                            Icon { width: 17px; height: 17px; y: (parent.height - self.height) / 2; d: Ico.map; ink: white; sw: 2px; }
+                                                            Text {
+                                                                vertical-alignment: center;
+                                                                text: "OPEN IN MAPS";
+                                                                color: white;
+                                                                font-size: 14px;
+                                                                font-weight: 700;
+                                                                letter-spacing: 1px;
+                                                            }
+                                                        }
+                                                        nav-ta := TouchArea { clicked => { root.open-url(VS.map-nav-url); } }
                                                     }
                                                 }
-                                                nav-ta := TouchArea { clicked => { root.open-url(VS.map-nav-url); } }
+                                                Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.cardline; }
+                                            }
+                                            // otherwise a simple count label
+                                            if !mapRoot.route: Rectangle {
+                                                height: 30px;
+                                                Text {
+                                                    x: VS.gut;
+                                                    height: 100%;
+                                                    vertical-alignment: center;
+                                                    text: VS.pins.length > 0 ? "\{VS.pins.length} PLACES" : "NO PLACES";
+                                                    color: VS.ink3;
+                                                    font-size: 11px;
+                                                    font-weight: 700;
+                                                    letter-spacing: 0.6px;
+                                                }
+                                            }
+                                            // scrollable places list — fills the rest of the sheet
+                                            Flickable {
+                                                vertical-stretch: 1;
+                                                viewport-width: self.width;
+                                                viewport-height: place-col.preferred-height;
+                                                place-col := VerticalLayout {
+                                                    width: parent.width;
+                                                    alignment: start;
+                                                    for p in VS.pins: Rectangle {
+                                                        height: 58px;
+                                                        Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.cardline; }
+                                                        HorizontalLayout {
+                                                            padding-left: VS.gut;
+                                                            padding-right: VS.gut;
+                                                            spacing: VS.gap-sm;
+                                                            VerticalLayout {
+                                                                horizontal-stretch: 1;
+                                                                alignment: center;
+                                                                spacing: 3px;
+                                                                Text { text: p.name; color: VS.ink; font-size: 13px; }
+                                                                Text { text: "\{p.rating} · \{p.note}"; color: VS.ink2; font-size: 11px; }
+                                                            }
+                                                            VerticalLayout {
+                                                                alignment: center;
+                                                                Text { text: p.dist; color: VS.ink3; font-size: 11px; horizontal-alignment: right; }
+                                                            }
+                                                        }
+                                                        // tap a place → open it in the phone's Maps app
+                                                        TouchArea { clicked => { if (p.lat != 0) { root.open-url("https://www.google.com/maps/search/?api=1&query=\{p.lat},\{p.lng}"); } } }
+                                                    }
+                                                }
                                             }
                                         }
-                                        Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.cardline; }
-                                    }
-                                    Rectangle {
-                                        height: 38%;
-                                        Flickable {
-                                            viewport-width: self.width;
-                                            viewport-height: place-col.preferred-height;
-                                            place-col := VerticalLayout {
-                                                width: parent.width;
-                                                alignment: start;
-                                                for p in VS.pins: Rectangle {
-                                                    height: 58px;
-                                                    Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.cardline; }
-                                                    HorizontalLayout {
-                                                        padding-left: VS.gut;
-                                                        padding-right: VS.gut;
-                                                        spacing: VS.gap-sm;
-                                                        VerticalLayout {
-                                                            horizontal-stretch: 1;
-                                                            alignment: center;
-                                                            spacing: 3px;
-                                                            Text { text: p.name; color: VS.ink; font-size: 13px; }
-                                                            Text { text: "\{p.rating} · \{p.note}"; color: VS.ink2; font-size: 11px; }
-                                                        }
-                                                        VerticalLayout {
-                                                            alignment: center;
-                                                            Text { text: p.dist; color: VS.ink3; font-size: 11px; horizontal-alignment: right; }
-                                                        }
-                                                    }
-                                                    // tap a place → open it in the phone's Maps app
-                                                    TouchArea { clicked => { if (p.lat != 0) { root.open-url("https://www.google.com/maps/search/?api=1&query=\{p.lat},\{p.lng}"); } } }
+                                        // drag handle hit-area (over the handle; the list stays scrollable)
+                                        TouchArea {
+                                            width: 100%;
+                                            height: 30px;
+                                            y: 0;
+                                            pointer-event(e) => {
+                                                if (e.kind == PointerEventKind.down) {
+                                                    mapRoot.dragging = true;
+                                                    mapRoot.drag-start-h = mapRoot.sheet-h;
+                                                }
+                                                if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
+                                                    mapRoot.dragging = false;
+                                                    mapRoot.sheet-h =
+                                                        mapRoot.sheet-h < (mapRoot.closed-h + mapRoot.peek-h) / 2 ? mapRoot.closed-h
+                                                        : mapRoot.sheet-h < (mapRoot.peek-h + mapRoot.half-h) / 2 ? mapRoot.peek-h
+                                                        : mapRoot.sheet-h < (mapRoot.half-h + mapRoot.full-h) / 2 ? mapRoot.half-h
+                                                        : mapRoot.full-h;
+                                                }
+                                            }
+                                            moved => {
+                                                if (mapRoot.dragging) {
+                                                    mapRoot.sheet-h = clamp(
+                                                        mapRoot.drag-start-h - (self.mouse-y - self.pressed-y),
+                                                        mapRoot.closed-h, mapRoot.full-h);
                                                 }
                                             }
                                         }
@@ -969,18 +1128,19 @@ component ActiveView inherits Rectangle {
                                 if VS.current-view == "web" && VS.web-blocks.length == 0 && VS.working-view != "web": EmptyState {
                                     icon-d: Ico.web; hint: "Ask Nova to look something up.";
                                 }
-                                if VS.current-view == "web" && VS.web-blocks.length > 0 && VS.working-view != "web": VerticalLayout {
-                                    // browser toolbar: tab-count · address · settings (kebab) — matches the concept
+                                if VS.current-view == "web" && VS.web-blocks.length > 0 && VS.working-view != "web": Rectangle {
+                                    VerticalLayout {
+                                    // browser toolbar: tab-count · address · Nova's-take · kebab
                                     Rectangle {
                                         height: 48px;
                                         background: VS.dark ? #191c24 : #eef0f4;
                                         HorizontalLayout {
                                             padding-left: 12px;
                                             padding-right: 6px;
-                                            spacing: 10px;
-                                            // tab-count box → opens the tab switcher
+                                            spacing: 8px;
+                                            // tab-count box → opens the tab switcher overlay
                                             Rectangle {
-                                                width: 48px;
+                                                width: 44px;
                                                 Rectangle {
                                                     width: 28px;
                                                     height: 28px;
@@ -991,100 +1151,374 @@ component ActiveView inherits Rectangle {
                                                     border-color: VS.ink3;
                                                     Text { text: "\{VS.web-tabs}"; color: VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                                 }
-                                                TouchArea { clicked => { if (VS.web-tabs > 0) { tabsw.show(); } } }
-                                                tabsw := PopupWindow {
-                                                    x: 6px;
-                                                    y: 44px;
-                                                    width: 264px;
-                                                    height: min(346px, VS.web-tab-titles.length * 50px + 12px);
-                                                    Rectangle {
-                                                        background: VS.card;
-                                                        border-radius: 12px;
-                                                        border-width: 1px;
-                                                        border-color: VS.line;
-                                                        VerticalLayout {
-                                                            padding: 6px;
-                                                            spacing: 2px;
-                                                            alignment: start;
-                                                            for title[i] in VS.web-tab-titles: Rectangle {
-                                                                height: 46px;
-                                                                border-radius: 9px;
-                                                                background: i == VS.web-active-tab ? VS.url-bg : transparent;
-                                                                sw-ta := TouchArea { clicked => { VS.switch-web-tab(i); tabsw.close(); } }
-                                                                HorizontalLayout {
-                                                                    padding-left: 12px;
-                                                                    padding-right: 6px;
-                                                                    spacing: 8px;
-                                                                    Text { text: title; color: VS.ink; font-size: 13px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                                                    Rectangle {
-                                                                        width: 34px;
-                                                                        Text { text: "\u{2715}"; color: VS.ink3; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
-                                                                        TouchArea { clicked => { VS.close-web-tab(i); } }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                TouchArea { clicked => { if (VS.web-tabs > 0) { VS.web-tabsw-open = true; } } }
                                             }
                                             // address
                                             Text { text: VS.web-url; color: VS.ink3; font-size: 12.5px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                            // settings kebab → menu (open in browser / close tab)
+                                            // Nova's take toggle (iOS only — flips between the live page and the summary)
+                                            if VS.has-web-reader: Rectangle {
+                                                width: takelbl.width + 24px;
+                                                height: 30px;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 15px;
+                                                background: VS.web-take-open ? VS.orange : (VS.dark ? #2a2f3a : #ffffff);
+                                                border-width: 1px;
+                                                border-color: VS.web-take-open ? VS.orange : VS.cardline;
+                                                takelbl := Text {
+                                                    x: (parent.width - self.width) / 2;
+                                                    y: (parent.height - self.height) / 2;
+                                                    text: VS.web-take-open ? "Page" : "Nova's take";
+                                                    color: VS.web-take-open ? white : VS.ink2;
+                                                    font-size: 12px;
+                                                    font-weight: 700;
+                                                }
+                                                TouchArea { clicked => { VS.web-take-open = !VS.web-take-open; } }
+                                            }
+                                            // settings kebab → menu overlay (open in browser / close tab)
                                             Rectangle {
-                                                width: 48px;
+                                                width: 40px;
                                                 Rectangle { width: 4px; height: 4px; border-radius: 2px; background: VS.ink2; x: (parent.width - self.width) / 2; y: parent.height / 2 - 9px; }
                                                 Rectangle { width: 4px; height: 4px; border-radius: 2px; background: VS.ink2; x: (parent.width - self.width) / 2; y: parent.height / 2 - 2px; }
                                                 Rectangle { width: 4px; height: 4px; border-radius: 2px; background: VS.ink2; x: (parent.width - self.width) / 2; y: parent.height / 2 + 5px; }
-                                                TouchArea { clicked => { webmenu.show(); } }
-                                                webmenu := PopupWindow {
-                                                    x: -158px;
-                                                    y: 44px;
-                                                    width: 200px;
-                                                    height: 106px;
-                                                    Rectangle {
-                                                        background: VS.card;
-                                                        border-radius: 12px;
-                                                        border-width: 1px;
-                                                        border-color: VS.line;
-                                                        VerticalLayout {
-                                                            padding: 6px;
-                                                            spacing: 2px;
-                                                            alignment: start;
-                                                            Rectangle {
-                                                                height: 46px;
-                                                                border-radius: 9px;
-                                                                background: op1.pressed ? VS.url-bg : transparent;
-                                                                Text { text: "Open in browser"; color: VS.ink; font-size: 13px; x: 14px; vertical-alignment: center; height: 100%; }
-                                                                op1 := TouchArea { clicked => { VS.open-web-external(); webmenu.close(); } }
-                                                            }
-                                                            Rectangle {
-                                                                height: 46px;
-                                                                border-radius: 9px;
-                                                                background: op2.pressed ? VS.url-bg : transparent;
-                                                                Text { text: "Close this tab"; color: VS.speaker-user; font-size: 13px; x: 14px; vertical-alignment: center; height: 100%; }
-                                                                op2 := TouchArea { clicked => { VS.close-web-tab(VS.web-active-tab); webmenu.close(); } }
-                                                            }
+                                                TouchArea { clicked => { VS.web-menu-open = true; } }
+                                            }
+                                        }
+                                        Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.line; }
+                                    }
+                                    // Content region. On iOS a WKWebView (positioned via report-web-geom) covers
+                                    // this and shows the LIVE page; the summary blocks below sit UNDER it and are
+                                    // revealed by "Nova's take" (which tucks the webview). Other platforms just
+                                    // show the blocks (no native reader).
+                                    webRegion := Rectangle {
+                                        vertical-stretch: 1;
+                                        clip: true;
+                                        background: VS.card;
+                                        init => { root.report-web-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed absolute-position => { root.report-web-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed width => { root.report-web-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed height => { root.report-web-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        Flickable {
+                                            viewport-width: self.width;
+                                            viewport-height: web-col.preferred-height;
+                                            web-col := VerticalLayout {
+                                                width: parent.width;
+                                                padding: VS.gut;
+                                                spacing: VS.gap-sm;
+                                                alignment: start;
+                                                if VS.has-web-reader: Text {
+                                                    text: "NOVA'S TAKE";
+                                                    color: VS.ink3;
+                                                    font-size: 11px;
+                                                    font-weight: 800;
+                                                }
+                                                for b in VS.web-blocks: Text {
+                                                    text: b.text;
+                                                    color: b.kind == "h" ? VS.ink : VS.ink2;
+                                                    font-size: b.kind == "h" ? 16px : 13px;
+                                                    font-weight: b.kind == "h" ? 800 : 400;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    }
+                                    // ---- tab switcher overlay (webview is tucked while this is open) ----
+                                    if VS.web-tabsw-open: Rectangle {
+                                        background: #00000055;
+                                        TouchArea { clicked => { VS.web-tabsw-open = false; } }
+                                        Rectangle {
+                                            x: 10px;
+                                            y: 54px;
+                                            width: min(280px, parent.width - 20px);
+                                            height: min(360px, VS.web-tab-titles.length * 50px + 12px);
+                                            background: VS.card;
+                                            border-radius: 12px;
+                                            border-width: 1px;
+                                            border-color: VS.line;
+                                            VerticalLayout {
+                                                padding: 6px;
+                                                spacing: 2px;
+                                                alignment: start;
+                                                for title[i] in VS.web-tab-titles: Rectangle {
+                                                    height: 46px;
+                                                    border-radius: 9px;
+                                                    background: i == VS.web-active-tab ? VS.url-bg : transparent;
+                                                    TouchArea { clicked => { VS.switch-web-tab(i); VS.web-tabsw-open = false; } }
+                                                    HorizontalLayout {
+                                                        padding-left: 12px;
+                                                        padding-right: 6px;
+                                                        spacing: 8px;
+                                                        Text { text: title; color: VS.ink; font-size: 13px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                                        Rectangle {
+                                                            width: 34px;
+                                                            Text { text: "\u{2715}"; color: VS.ink3; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                                            TouchArea { clicked => { VS.close-web-tab(i); } }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
+                                    }
+                                    // ---- kebab menu overlay ----
+                                    if VS.web-menu-open: Rectangle {
+                                        background: #00000055;
+                                        TouchArea { clicked => { VS.web-menu-open = false; } }
+                                        Rectangle {
+                                            x: parent.width - self.width - 8px;
+                                            y: 54px;
+                                            width: 200px;
+                                            height: 106px;
+                                            background: VS.card;
+                                            border-radius: 12px;
+                                            border-width: 1px;
+                                            border-color: VS.line;
+                                            VerticalLayout {
+                                                padding: 6px;
+                                                spacing: 2px;
+                                                alignment: start;
+                                                Rectangle {
+                                                    height: 46px;
+                                                    border-radius: 9px;
+                                                    background: op1.pressed ? VS.url-bg : transparent;
+                                                    Text { text: "Open in browser"; color: VS.ink; font-size: 13px; x: 14px; vertical-alignment: center; height: 100%; }
+                                                    op1 := TouchArea { clicked => { VS.open-web-external(); VS.web-menu-open = false; } }
+                                                }
+                                                Rectangle {
+                                                    height: 46px;
+                                                    border-radius: 9px;
+                                                    background: op2.pressed ? VS.url-bg : transparent;
+                                                    Text { text: "Close this tab"; color: VS.speaker-user; font-size: 13px; x: 14px; vertical-alignment: center; height: 100%; }
+                                                    op2 := TouchArea { clicked => { VS.close-web-tab(VS.web-active-tab); VS.web-menu-open = false; } }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // -- videos --
+                                if VS.current-view == "videos" && VS.working-view == "videos": WorkingPill {
+                                    label: VS.working-label;
+                                }
+                                if VS.current-view == "videos" && VS.videos.length == 0 && VS.working-view != "videos": EmptyState {
+                                    icon-d: Ico.video; hint: "Ask Nova to find videos.";
+                                }
+                                // results grid (shown when nothing is playing)
+                                if VS.current-view == "videos" && VS.videos.length > 0 && VS.working-view != "videos" && VS.playing-video-id == "": Flickable {
+                                    viewport-width: self.width;
+                                    viewport-height: vid-col.preferred-height;
+                                    vid-col := VerticalLayout {
+                                        width: parent.width;
+                                        padding: VS.gut;
+                                        spacing: VS.gap;
+                                        alignment: start;
+                                        Text {
+                                            text: "FOUND \{VS.videos.length} · \"\{VS.videos-query}\"";
+                                            color: VS.ink3;
+                                            font-size: 11px;
+                                        }
+                                        // Search history chips — tap to flip back to a past search.
+                                        if VS.video-tabs > 1: Flickable {
+                                            height: 30px;
+                                            viewport-width: vtabrow.preferred-width;
+                                            viewport-height: 30px;
+                                            vtabrow := HorizontalLayout {
+                                                spacing: 6px;
+                                                alignment: start;
+                                                for title[i] in VS.video-tab-titles: Rectangle {
+                                                    height: 28px;
+                                                    border-radius: 14px;
+                                                    background: i == VS.video-active-tab ? VS.orange : VS.url-bg;
+                                                    HorizontalLayout {
+                                                        padding-left: 12px;
+                                                        padding-right: 12px;
+                                                        Text {
+                                                            text: title;
+                                                            color: i == VS.video-active-tab ? white : VS.ink2;
+                                                            font-size: 12px;
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                    }
+                                                    TouchArea { clicked => { VS.switch-video-tab(i); } }
+                                                }
+                                            }
+                                        }
+                                        // one card per video result → tap to play
+                                        for it[i] in VS.videos: Rectangle {
+                                            height: 200px;
+                                            border-radius: 14px;
+                                            background: @linear-gradient(140deg, it.tint 0%, it.tint.darker(0.45) 100%);
+                                            clip: true;
+                                            Image { width: 100%; height: 100%; source: it.pic; image-fit: cover; }
+                                            // play glyph
+                                            Rectangle {
+                                                width: 54px;
+                                                height: 54px;
+                                                border-radius: 27px;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                background: #00000066;
+                                                Text {
+                                                    text: "\u{25b6}";
+                                                    color: white;
+                                                    font-size: 20px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                    width: 100%;
+                                                    height: 100%;
+                                                }
+                                            }
+                                            // duration badge
+                                            if it.dur != "": Rectangle {
+                                                x: parent.width - self.width - 8px;
+                                                y: 8px;
+                                                width: durtxt.width + 12px;
+                                                height: 20px;
+                                                border-radius: 5px;
+                                                background: #000000aa;
+                                                durtxt := Text {
+                                                    text: it.dur;
+                                                    color: white;
+                                                    font-size: 11px;
+                                                    x: 6px;
+                                                    vertical-alignment: center;
+                                                    height: 100%;
+                                                }
+                                            }
+                                            // title + channel footer
+                                            Rectangle {
+                                                y: parent.height - self.height;
+                                                width: 100%;
+                                                height: 56px;
+                                                background: @linear-gradient(0deg, #000000d0 0%, #00000000 100%);
+                                                VerticalLayout {
+                                                    padding-left: 12px;
+                                                    padding-right: 12px;
+                                                    padding-bottom: 9px;
+                                                    alignment: end;
+                                                    spacing: 1px;
+                                                    Text {
+                                                        text: it.title;
+                                                        color: white;
+                                                        font-size: 13px;
+                                                        font-weight: 700;
+                                                        overflow: elide;
+                                                        horizontal-alignment: left;
+                                                    }
+                                                    Text {
+                                                        text: it.channel;
+                                                        color: #ffffffcc;
+                                                        font-size: 11px;
+                                                        overflow: elide;
+                                                        horizontal-alignment: left;
+                                                    }
+                                                }
+                                            }
+                                            if it.failed: Text {
+                                                x: 0;
+                                                width: 100%;
+                                                y: parent.height / 2 - 34px;
+                                                text: "couldn't load thumbnail";
+                                                color: #ffffffcc;
+                                                font-size: 11px;
+                                                horizontal-alignment: center;
+                                            }
+                                            TouchArea { clicked => { VS.play-video(i); } }
+                                        }
+                                    }
+                                }
+                                // player (shown while a video is playing)
+                                if VS.current-view == "videos" && VS.playing-video-id != "": VerticalLayout {
+                                    // top bar: back · title · open-in-YouTube
+                                    Rectangle {
+                                        height: 48px;
+                                        background: VS.dark ? #191c24 : #eef0f4;
+                                        HorizontalLayout {
+                                            padding-left: 4px;
+                                            padding-right: 6px;
+                                            spacing: 6px;
+                                            Rectangle {
+                                                width: 40px;
+                                                Text {
+                                                    text: "\u{2039}";
+                                                    color: VS.ink;
+                                                    font-size: 26px;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                    width: 100%;
+                                                    height: 100%;
+                                                }
+                                                TouchArea { clicked => { VS.close-video-player(); } }
+                                            }
+                                            Text {
+                                                text: VS.playing-video-title;
+                                                color: VS.ink;
+                                                font-size: 13px;
+                                                font-weight: 700;
+                                                horizontal-stretch: 1;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            Rectangle {
+                                                width: 44px;
+                                                Icon {
+                                                    d: Ico.web;
+                                                    ink: VS.ink2;
+                                                    sw: 1.8px;
+                                                    width: 18px;
+                                                    height: 18px;
+                                                    x: (parent.width - self.width) / 2;
+                                                    y: (parent.height - self.height) / 2;
+                                                }
+                                                TouchArea { clicked => { VS.open-video-external(); } }
+                                            }
+                                        }
                                         Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.line; }
                                     }
+                                    // 16:9 player region — on iOS a WKWebView (YouTube embed) covers this.
+                                    Rectangle {
+                                        height: parent.width * 9 / 16;
+                                        background: #000000;
+                                        init => { root.report-video-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed absolute-position => { root.report-video-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed width => { root.report-video-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        changed height => { root.report-video-geom(self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                                        // Non-iOS fallback: no native player, tap to open externally.
+                                        if !VS.has-web-reader: Rectangle {
+                                            Text {
+                                                text: "\u{25b6}  Open in browser";
+                                                color: white;
+                                                font-size: 14px;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                                width: 100%;
+                                                height: 100%;
+                                            }
+                                            TouchArea { clicked => { VS.open-video-external(); } }
+                                        }
+                                    }
+                                    // below the player: title + a note that Nova can see the frame
                                     Flickable {
                                         vertical-stretch: 1;
                                         viewport-width: self.width;
-                                        viewport-height: web-col.preferred-height;
-                                        web-col := VerticalLayout {
+                                        viewport-height: pinfo.preferred-height;
+                                        pinfo := VerticalLayout {
                                             width: parent.width;
                                             padding: VS.gut;
-                                            spacing: VS.gap-sm;
+                                            spacing: 8px;
                                             alignment: start;
-                                            for b in VS.web-blocks: Text {
-                                                text: b.text;
-                                                color: b.kind == "h" ? VS.ink : VS.ink2;
-                                                font-size: b.kind == "h" ? 16px : 13px;
-                                                font-weight: b.kind == "h" ? 800 : 400;
+                                            Text {
+                                                text: VS.playing-video-title;
+                                                color: VS.ink;
+                                                font-size: 15.5px;
+                                                font-weight: 700;
+                                                wrap: word-wrap;
+                                            }
+                                            if VS.has-web-reader: Text {
+                                                text: "Ask Nova what's happening — she can see the video as it plays.";
+                                                color: VS.ink3;
+                                                font-size: 12px;
                                                 wrap: word-wrap;
                                             }
                                         }
@@ -1148,8 +1582,36 @@ export component MainWindow inherits Window {
     callback retry-image(int);   // re-fetch a failed image thumbnail
     callback retry-product(int); // re-fetch a failed product thumbnail
     callback retry-map();        // re-fetch the failed static map tile
+    // iOS: the map WKWebView draws ABOVE the Slint layer, so any Slint overlay on the map view
+    // (add-view sheet, settings, lightbox, product sheet) would be hidden behind it. Tell Rust to
+    // hide the webview while any such overlay is up, and re-show it when they all close.
+    callback set-map-obscured(bool);
+    property <bool> map-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
+    changed map-obscured => { self.set-map-obscured(self.map-obscured); }
     property <bool> map-active: VS.current-view == "map";
     changed map-active => { self.map-active-changed(self.map-active); }
+
+    // iOS live web reader: a real WKWebView is positioned to the web content region reported
+    // here, hidden when the web view is inactive, and tucked away when a Slint overlay (the
+    // tab switcher, kebab menu, Nova's take, settings, lightbox…) needs to draw over it.
+    callback report-web-geom(length, length, length, length);
+    callback web-active-changed(bool);
+    callback set-web-obscured(bool);
+    property <bool> web-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open
+        || VS.web-take-open || VS.web-tabsw-open || VS.web-menu-open;
+    changed web-obscured => { self.set-web-obscured(self.web-obscured); }
+    property <bool> web-active: VS.current-view == "web";
+    changed web-active => { self.web-active-changed(self.web-active); }
+
+    // iOS video player: a WKWebView (YouTube embed) covering the player region reported here,
+    // shown only while a video plays, and tucked away behind Slint overlays.
+    callback report-video-geom(length, length, length, length);
+    callback video-active-changed(bool);
+    callback set-video-obscured(bool);
+    property <bool> video-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
+    changed video-obscured => { self.set-video-obscured(self.video-obscured); }
+    property <bool> video-active: VS.current-view == "videos" && VS.playing-video-id != "";
+    changed video-active => { self.video-active-changed(self.video-active); }
 
     in-out property <int> engine: 1; // 0=Supertonic·EN 1=Piper·ID 2=Soniox·ID 3=Soniox·EN
     in-out property <int> stt-engine: 0; // 0=Moonshine 1=Whisper 2=Qwen3 3=Omni 4=Soniox 5=Native 6=Dolphin
@@ -1244,10 +1706,21 @@ export component MainWindow inherits Window {
     callback opus-stream(int, int); // downlink cap kbps (0=unlimited), opus bitrate kbps
     callback realtime-toggle(); // connect/disconnect the realtime WebRTC agent
     callback persona-switched(); // user swiped the agent icon → reconnect to the new persona's bot
+    callback engine-switched();  // user flipped Cascade/Duplex → reconnect with the new ?mode=
+    callback view-image(int);   // lightbox image opened/switched (index, or -1 = closed) → bot sees it
+    // Fire view-image whenever the lightbox image changes — open, swipe, arrows, or close — in ONE
+    // place instead of wiring every tap site. Rust reads images[index].url and hands it to the bot.
+    property <int> lb-track-idx: VS.lightbox-index;
+    property <bool> lb-track-open: VS.lightbox-open;
+    changed lb-track-idx => { if (VS.lightbox-open) { root.view-image(VS.lightbox-index); } }
+    changed lb-track-open => { root.view-image(VS.lightbox-open ? VS.lightbox-index : -1); }
     callback mic-mute(bool);    // mute/unmute the outbound mic on the realtime client
     callback open-url(string);  // open a URL in the phone (product store page, map location, …)
     callback interrupt-nova();  // tap the waveform to cut Nova off mid-sentence
+    callback pick-image();      // tap the upload button → open the iOS photo picker
     callback save-setting(string, string);  // persist a setting (key, value) to the app's files dir
+    callback request-permissions();  // prompt for mic (+ location) in-app; result lands in VS.mic-perm
+    callback open-app-settings();    // open this app's OS Settings page (recover a blocked mic)
 
     preferred-width: 400px;
     preferred-height: 800px;
@@ -1423,9 +1896,11 @@ export component MainWindow inherits Window {
                                     // Truthful: show the live status while connecting/reconnecting,
                                     // a retry prompt on failure, and only say "TALKING" once really live.
                                     text: root.rt-failed ? root.rt-status
+                                        : VS.mic-perm == 2 ? "MICROPHONE BLOCKED · TAP TO ENABLE IN SETTINGS"
                                         : !root.rt-connected ? "TAP \{Persona.name-upper} TO CONNECT · SWIPE TO SWITCH"
                                         : !root.rt-live ? root.rt-status
                                         : root.agent-active ? "\{Persona.name-upper} — TAP TO STOP"
+                                        : VS.mic-muted ? "PAUSED — TAP WAVEFORM TO RESUME"
                                         : root.user-active ? "YOU"
                                         : "TALKING";
                                     color: #ffffffee;
@@ -1437,7 +1912,64 @@ export component MainWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 16px;      // wider gaps so the +/chevron buttons breathe
                                     // no alignment:center — waveform stretches, +/chevron anchor to the edges
-                                    Rectangle {
+                                    // collapsed: a mini animated persona avatar + name keeps the agent
+                                    // "alive" here now that the big presence orb is hidden. Tap = connect/
+                                    // disconnect · swipe = switch persona (mirrors the orb's gesture).
+                                    if VS.collapsed: miniAgent := Rectangle {
+                                        width: 104px;
+                                        property <bool> mbreathe: false;
+                                        Timer {
+                                            interval: 2200ms;
+                                            running: true;
+                                            triggered => { miniAgent.mbreathe = !miniAgent.mbreathe; }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: 2px;
+                                            spacing: 8px;
+                                            alignment: start;
+                                            Rectangle {
+                                                width: 38px;
+                                                Image {
+                                                    width: (miniAgent.mbreathe ? 34px : 31px) + (root.mic-active ? 3px : 0px);
+                                                    height: self.width;
+                                                    x: (parent.width - self.width) / 2;
+                                                    y: (parent.height - self.height) / 2;
+                                                    source: Persona.index == 1
+                                                        ? (root.agent-active ? root.kaira-talk[root.kaira-frame] : @image-url("../assets/kaira/idle.png"))
+                                                        : @image-url("../assets/agent_icon_orange.svg");
+                                                    image-fit: contain;
+                                                    // Nova reads as a white silhouette on the orange slab; Kaira's
+                                                    // full-colour art is left untouched (transparent = no colorize).
+                                                    colorize: Persona.index == 0 ? white : transparent;
+                                                    opacity: root.rt-connected ? 1.0 : 0.85;
+                                                    animate width { duration: 1600ms; easing: ease-in-out; }
+                                                }
+                                            }
+                                            Text {
+                                                text: Persona.name;
+                                                color: white;
+                                                font-size: 13px;
+                                                font-weight: 800;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                        }
+                                        TouchArea {
+                                            property <length> down-x;
+                                            pointer-event(e) => {
+                                                if (e.kind == PointerEventKind.down) { self.down-x = self.mouse-x; }
+                                                if (e.kind == PointerEventKind.up) {
+                                                    if (self.mouse-x - self.down-x > 44px || self.down-x - self.mouse-x > 44px) {
+                                                        Persona.index = Persona.index == 0 ? 1 : 0;
+                                                        root.persona-switched();
+                                                    } else {
+                                                        root.realtime-toggle();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !VS.collapsed: Rectangle {
                                         width: 48px;
                                         height: 48px;
                                         Rectangle {
@@ -1459,18 +1991,18 @@ export component MainWindow inherits Window {
                                                 sw: 2px;
                                             }
                                         }
-                                        share-ta := TouchArea { clicked => { } }
+                                        share-ta := TouchArea { clicked => { root.pick-image(); } }
                                     }
                                     Rectangle {
                                         horizontal-stretch: 1;
                                         height: 42px;
                                         border-radius: 12px;
-                                        // dims on press while Nova's talking, so the tap-to-stop registers
-                                        background: (root.agent-active && wave-ta.pressed) ? #f0f0f0 : white;
+                                        // paused → soft grey · pressed → dim · else white
+                                        background: VS.mic-muted ? (VS.dark ? #e5e7ee : #eef0f4) : (wave-ta.pressed ? #f0f0f0 : white);
                                         clip: true;
-                                        // scrolling real-level waveform: each bar is one moment of history.
-                                        // + = Nova (orange), − = you (teal), flat = idle. Colour tells who's talking.
-                                        HorizontalLayout {
+                                        // live scrolling waveform (hidden while paused): each bar is one moment
+                                        // of history. + = Nova (orange), − = you (teal), flat = idle.
+                                        if !VS.mic-muted: HorizontalLayout {
                                             alignment: center;
                                             spacing: 1px;
                                             for v in root.wave: Rectangle {
@@ -1485,12 +2017,43 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                         }
-                                        // tap the waveform to cut Nova off — only live while she's actually
-                                        // speaking, so it never eats a stray tap when it's your turn.
+                                        // paused standby animation — calm breathing bars
+                                        if VS.mic-muted: PausedWave { }
+                                        // tap: resume if paused · stop Nova if she's talking · else pause.
                                         wave-ta := TouchArea {
-                                            enabled: root.agent-active;
-                                            clicked => { root.interrupt-nova(); }
+                                            enabled: root.rt-connected;
+                                            clicked => {
+                                                if (VS.mic-muted) { VS.mic-muted = false; root.mic-mute(false); }
+                                                else if (root.agent-active) { root.interrupt-nova(); }
+                                                else { VS.mic-muted = true; root.mic-mute(true); }
+                                            }
                                         }
+                                    }
+                                    // collapsed: the mini avatar took the left slot, so the image-upload
+                                    // button moves here, beside the collapse chevron.
+                                    if VS.collapsed: Rectangle {
+                                        width: 48px;
+                                        height: 48px;
+                                        Rectangle {
+                                            width: 42px;
+                                            height: 42px;
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            border-radius: 12px;
+                                            border-width: 1.5px;
+                                            border-color: #ffffff88;
+                                            background: share-ta2.pressed ? #ffffff22 : transparent;
+                                            Icon {
+                                                width: 20px;
+                                                height: 20px;
+                                                x: (parent.width - self.width) / 2;
+                                                y: (parent.height - self.height) / 2;
+                                                d: Ico.attach;
+                                                ink: white;
+                                                sw: 2px;
+                                            }
+                                        }
+                                        share-ta2 := TouchArea { clicked => { root.pick-image(); } }
                                     }
                                     Rectangle {
                                         width: 48px;
@@ -1535,7 +2098,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "right": SwitcherRail {
                                 on-left: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
@@ -1554,7 +2117,7 @@ export component MainWindow inherits Window {
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
                             }
-                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "bottom": SwitcherRailH {
                                 drop-down: false; rt-connected: root.rt-connected;
                                 realtime-toggle => { root.realtime-toggle(); }
@@ -1860,6 +2423,62 @@ export component MainWindow inherits Window {
                 }
 
 
+                // "add a view" sheet — a root-level overlay (not a PopupWindow) so the native
+                // Mapbox webview never covers it on iOS. Opened from the + button in either rail.
+                if VS.addmenu-open: Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: #00000099;
+                    TouchArea { clicked => { VS.addmenu-open = false; } }   // tap the scrim → close
+                    Rectangle {
+                        width: min(parent.width - 40px, 420px);
+                        x: (parent.width - self.width) / 2;
+                        height: menucol.preferred-height;
+                        y: parent.height - self.height - 28px;   // bottom sheet — rail-position agnostic
+                        border-radius: VS.radius;
+                        background: VS.card;
+                        border-width: 1px;
+                        border-color: VS.cardline;
+                        clip: true;
+                        TouchArea { }   // swallow taps on the sheet
+                        menucol := VerticalLayout {
+                            padding: 10px;
+                            spacing: 2px;
+                            alignment: start;
+                            Rectangle {
+                                height: 34px;
+                                Text {
+                                    x: 12px; height: 100%; vertical-alignment: center;
+                                    text: "ADD A VIEW"; color: VS.ink3; font-size: 11px; font-weight: 800; letter-spacing: 2px;
+                                }
+                            }
+                            for v in [
+                                { id: "chat", label: "Chat" },
+                                { id: "images", label: "Images" },
+                                { id: "web", label: "Web" },
+                                { id: "map", label: "Map" },
+                                { id: "products", label: "Shopping" },
+                                { id: "docs", label: "Documents" },
+                            ]: Rectangle {
+                                height: 52px;
+                                border-radius: 12px;
+                                background: itemo-ta.pressed ? VS.url-bg : (VS.current-view == v.id ? VS.url-bg : transparent);
+                                HorizontalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 12px;
+                                    spacing: 13px;
+                                    Rectangle {
+                                        width: 22px;
+                                        Icon { width: 19px; height: 19px; x: 0; y: (parent.height - self.height) / 2; d: Ico.path(v.id); ink: VS.current-view == v.id ? VS.orange : VS.ink2; sw: 1.8px; }
+                                    }
+                                    Text { text: v.label; color: VS.ink; font-size: 15px; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                                itemo-ta := TouchArea { clicked => { VS.add-view(v.id); VS.addmenu-open = false; } }
+                            }
+                        }
+                    }
+                }
+
                 // settings sheet — opened from the gear (movable rail + theme + dev lab)
                 if VS.settings-open: Rectangle {
                     width: 100%;
@@ -1946,6 +2565,25 @@ export component MainWindow inherits Window {
                                     }
                                 }
                             }
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Engine (A/B)"; color: VS.ink2; font-size: 12px; font-weight: 700; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        height: 44px; border-radius: 11px;
+                                        background: Engine.index == 0 ? VS.orange : VS.url-bg;
+                                        Text { text: "Cascade"; color: Engine.index == 0 ? white : VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        TouchArea { clicked => { if (Engine.index != 0) { Engine.index = 0; root.save-setting("engine", "cascade"); root.engine-switched(); } } }
+                                    }
+                                    Rectangle {
+                                        height: 44px; border-radius: 11px;
+                                        background: Engine.index == 1 ? VS.orange : VS.url-bg;
+                                        Text { text: "Duplex"; color: Engine.index == 1 ? white : VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        TouchArea { clicked => { if (Engine.index != 1) { Engine.index = 1; root.save-setting("engine", "duplex"); root.engine-switched(); } } }
+                                    }
+                                }
+                            }
                             Rectangle { height: 1px; background: VS.line; }
                             Rectangle {
                                 height: 48px; border-radius: 11px;
@@ -1956,6 +2594,119 @@ export component MainWindow inherits Window {
                                     Text { text: "\u{203A}"; color: VS.ink3; font-size: 20px; vertical-alignment: center; }
                                 }
                                 lab-ta := TouchArea { clicked => { VS.settings-open = false; root.tab = 1; } }
+                            }
+                        }
+                    }
+                }
+
+                // First-run onboarding + permission priming (see src/permissions.rs). An
+                // opaque full-screen takeover: orient the user, explain why the mic/location
+                // are needed, then request them — shown once (persisted via "onboarding_seen").
+                if VS.onboarding-open: Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: VS.canvas;   // opaque — a takeover, not a dismissible scrim
+                    TouchArea { }            // swallow taps so nothing behind reacts
+                    VerticalLayout {
+                        padding: 32px;
+                        padding-top: 64px;
+                        padding-bottom: 24px;
+                        spacing: 16px;
+                        Text {
+                            text: "VOID_AI";
+                            color: VS.ink3; font-size: 12px; font-weight: 800; letter-spacing: 3px;
+                        }
+                        Text {
+                            text: "Meet \{Persona.name}";
+                            color: VS.ink; font-size: 30px; font-weight: 800;
+                        }
+                        Text {
+                            text: "Your voice-first assistant. Tap to talk — \{Persona.name} listens, answers out loud, and shows results right on screen.";
+                            color: VS.ink2; font-size: 15px; wrap: word-wrap;
+                        }
+                        Rectangle { height: 8px; }
+                        // Why we need each permission (with a live granted/denied check mark).
+                        VerticalLayout {
+                            spacing: 16px;
+                            HorizontalLayout {
+                                spacing: 14px;
+                                Text { text: "🎤"; font-size: 24px; vertical-alignment: center; }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text { text: "Microphone"; color: VS.ink; font-size: 15px; font-weight: 700; }
+                                    Text { text: "Required — so \{Persona.name} can hear you speak."; color: VS.ink2; font-size: 13px; wrap: word-wrap; }
+                                }
+                                Text {
+                                    text: VS.mic-perm == 1 ? "✓" : VS.mic-perm == 2 ? "✕" : "";
+                                    color: VS.mic-perm == 2 ? #ff6b6b : #34c759;
+                                    font-size: 18px; font-weight: 800; vertical-alignment: center;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 14px;
+                                Text { text: "📍"; font-size: 24px; vertical-alignment: center; }
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    Text { text: "Location"; color: VS.ink; font-size: 15px; font-weight: 700; }
+                                    Text { text: "Optional — so directions start from where you are."; color: VS.ink2; font-size: 13px; wrap: word-wrap; }
+                                }
+                                Text {
+                                    text: VS.loc-perm == 1 ? "✓" : "";
+                                    color: #34c759; font-size: 18px; font-weight: 800; vertical-alignment: center;
+                                }
+                            }
+                        }
+                        Rectangle { vertical-stretch: 1; }   // push the CTAs to the bottom
+                        if VS.mic-perm == 2: Text {
+                            text: "Microphone access was denied. Enable it in Settings to talk to \{Persona.name}.";
+                            color: #ff8a6f; font-size: 13px; wrap: word-wrap; horizontal-alignment: center;
+                        }
+                        // Primary CTA: first tap requests the mic (label flips once resolved),
+                        // second tap enters the app. Reading is granted → straight to "Start".
+                        Rectangle {
+                            height: 54px; border-radius: 15px;
+                            background: VS.orange;
+                            opacity: cta-ta.pressed ? 0.82 : 1.0;
+                            Text {
+                                text: VS.mic-perm == 0 ? "Enable microphone"
+                                    : VS.mic-perm == 1 ? "Start talking"
+                                    : "Continue";
+                                color: white; font-size: 16px; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: 100%; height: 100%;
+                            }
+                            cta-ta := TouchArea {
+                                clicked => {
+                                    if (VS.mic-perm == 0) {
+                                        root.request-permissions();
+                                    } else {
+                                        root.save-setting("onboarding_seen", "1");
+                                        VS.onboarding-open = false;
+                                    }
+                                }
+                            }
+                        }
+                        if VS.mic-perm == 2: Rectangle {
+                            height: 46px; border-radius: 13px;
+                            background: set-ta.pressed ? VS.url-bg : transparent;
+                            border-width: 1px; border-color: VS.cardline;
+                            Text { text: "Open Settings"; color: VS.ink; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                            set-ta := TouchArea { clicked => { root.open-app-settings(); } }
+                        }
+                        // Escape hatch so a hesitant user is never trapped on this screen.
+                        Rectangle {
+                            height: 40px;
+                            Text {
+                                text: "Not now";
+                                color: VS.ink3; font-size: 13px; font-weight: 600;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: 100%; height: 100%;
+                            }
+                            TouchArea {
+                                clicked => {
+                                    root.save-setting("onboarding_seen", "1");
+                                    VS.onboarding-open = false;
+                                }
                             }
                         }
                     }
