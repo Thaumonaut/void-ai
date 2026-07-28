@@ -51,6 +51,28 @@ pub fn play(vid: &str) {
     apply_pending();
 }
 
+/// Load the YouTube embed via an `<iframe>` on a page with a REAL https origin (`baseURL`).
+/// Navigating straight to the embed URL from an `about:blank` page gives a null origin, which
+/// YouTube's player rejects ("config error / won't play"); a real baseURL makes the embed's
+/// referrer valid. We use `loadHTMLString:` (the proven WKWebView path — hand-rolling an
+/// NSURLRequest tripped objc2's msg_send verification → SIGABRT).
+unsafe fn load_html_redirect(webview: &AnyObject, url: &str) {
+    let esc = url.replace('&', "&amp;").replace('"', "&quot;");
+    let html = format!(
+        "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>\
+         <style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}\
+         iframe{{border:0;position:absolute;inset:0;width:100%;height:100%}}</style></head>\
+         <body><iframe src=\"{esc}\" allow='autoplay;encrypted-media;picture-in-picture' allowfullscreen></iframe></body></html>"
+    );
+    let html_ns = NSString::from_str(&html);
+    let base = NSString::from_str("https://www.youtube.com/");
+    if let Some(base_url) = NSURL::URLWithString(&base) {
+        // loadHTMLString:baseURL: returns WKNavigation* — declare the object return (matches
+        // ios_map); declaring `()` mismatches the encoding and objc2 aborts.
+        let _: *mut AnyObject = msg_send![webview, loadHTMLString: &*html_ns, baseURL: &*base_url];
+    }
+}
+
 fn apply_pending() {
     unsafe {
         PLAYER.with(|m| {
@@ -62,13 +84,8 @@ fn apply_pending() {
                 if already {
                     return;
                 }
-                let ns = NSString::from_str(&url);
-                if let Some(nsurl) = NSURL::URLWithString(&ns) {
-                    let req: Retained<AnyObject> =
-                        msg_send![class!(NSURLRequest), requestWithURL: &*nsurl];
-                    let _: () = msg_send![&**wv, loadRequest: &*req];
-                    LOADED_URL.with(|l| *l.borrow_mut() = Some(url));
-                }
+                load_html_redirect(&**wv, &url);
+                LOADED_URL.with(|l| *l.borrow_mut() = Some(url));
             });
         });
     }
@@ -118,11 +135,11 @@ pub fn stop() {
     unsafe {
         PLAYER.with(|m| {
             if let Some(wv) = m.borrow().as_ref() {
-                let ns = NSString::from_str("about:blank");
-                if let Some(nsurl) = NSURL::URLWithString(&ns) {
-                    let req: Retained<AnyObject> =
-                        msg_send![class!(NSURLRequest), requestWithURL: &*nsurl];
-                    let _: () = msg_send![&**wv, loadRequest: &*req];
+                // Blank the page so YouTube's audio stops (hiding alone keeps it playing).
+                let blank = NSString::from_str("<!doctype html><title>…</title><body style='background:#000'>");
+                let base = NSString::from_str("about:blank");
+                if let Some(base_url) = NSURL::URLWithString(&base) {
+                    let _: *mut AnyObject = msg_send![&**wv, loadHTMLString: &*blank, baseURL: &*base_url];
                 }
                 let _: () = msg_send![&**wv, setHidden: true];
             }
@@ -166,8 +183,10 @@ pub fn snapshot_to_vision() {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 crate::realtime::set_viewing_bytes(b64);
             });
-            let nil_config: *const AnyObject = std::ptr::null();
-            let _: () = msg_send![&**wv, takeSnapshotWithConfiguration: nil_config,
+            // nil WKSnapshotConfiguration → default (full visible rect). Pass a typed nil object
+            // (Option<&AnyObject>::None encodes as `@`), not a raw pointer that could mis-encode.
+            let no_config: Option<&AnyObject> = None;
+            let _: () = msg_send![&**wv, takeSnapshotWithConfiguration: no_config,
                                           completionHandler: &*handler];
         });
     }

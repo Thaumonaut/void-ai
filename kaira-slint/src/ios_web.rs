@@ -44,6 +44,25 @@ pub fn load_url(url: &str) {
     apply_pending();
 }
 
+/// Navigate a WKWebView to a remote URL. We deliberately do NOT hand-build an `NSURLRequest`
+/// via `class!/msg_send!` — that trips objc2's debug message-send verification and aborts the
+/// process (SIGABRT). Instead we load a tiny HTML shim (the same `loadHTMLString:` path the map
+/// uses reliably) whose script redirects the top frame to the target — a normal navigation.
+unsafe fn load_remote(webview: &AnyObject, url: &str) {
+    let esc = url.replace('\\', "\\\\").replace('\'', "\\'");
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><title>…</title>\
+         <body style='background:#000'><script>location.replace('{esc}')</script>"
+    );
+    let html_ns = NSString::from_str(&html);
+    let base = NSString::from_str("about:blank");
+    if let Some(base_url) = NSURL::URLWithString(&base) {
+        // loadHTMLString:baseURL: returns a WKNavigation* — declare the object return (like
+        // ios_map does); declaring `()` mismatches the encoding and objc2 aborts the process.
+        let _: *mut AnyObject = msg_send![webview, loadHTMLString: &*html_ns, baseURL: &*base_url];
+    }
+}
+
 fn apply_pending() {
     unsafe {
         WEB_VIEW.with(|m| {
@@ -56,13 +75,8 @@ fn apply_pending() {
                 if already {
                     return;
                 }
-                let ns = NSString::from_str(&url);
-                if let Some(nsurl) = NSURL::URLWithString(&ns) {
-                    let req: Retained<AnyObject> =
-                        msg_send![class!(NSURLRequest), requestWithURL: &*nsurl];
-                    let _: () = msg_send![&**wv, loadRequest: &*req];
-                    LOADED_URL.with(|l| *l.borrow_mut() = Some(url));
-                }
+                load_remote(&**wv, &url);
+                LOADED_URL.with(|l| *l.borrow_mut() = Some(url));
             });
         });
     }
