@@ -100,7 +100,13 @@ pub fn show_at(window: &slint::Window, x: f32, y: f32, w: f32, h: f32) {
             let alloc: Allocated<AnyObject> = msg_send![class!(WKWebView), alloc];
             let webview: Retained<AnyObject> =
                 msg_send![alloc, initWithFrame: frame, configuration: &*config];
-            let _: () = msg_send![&*webview, setOpaque: false];
+            // Opaque + a solid white backing: real pages assume a white page, and pages with a
+            // transparent background must NOT let the Slint chat/summary behind show through.
+            let _: () = msg_send![&*webview, setOpaque: true];
+            let white: *mut AnyObject = msg_send![class!(UIColor), whiteColor];
+            let _: () = msg_send![&*webview, setBackgroundColor: white];
+            let scroll: *mut AnyObject = msg_send![&*webview, scrollView];
+            let _: () = msg_send![scroll, setBackgroundColor: white];
             let host: &AnyObject = &*host_ptr;
             let _: () = msg_send![host, addSubview: &*webview];
             WEB_VIEW.with(|m| *m.borrow_mut() = Some(webview));
