@@ -393,6 +393,22 @@ SYSTEM_PROMPT = (
     "emoji; you're read aloud, so keep it snappy."
 )
 
+# Gemini Live runs warmer and wordier than the cascade LLM and soft-pedals the persona, so without
+# this Nova's replies balloon and go polite (especially the opening line). Appended to the Nova
+# prompt on the duplex path ONLY (Kaira keeps her own warm prompt untouched).
+NOVA_GEMINI_REINFORCE = (
+    "\n\n=== DELIVERY — NON-NEGOTIABLE ===\n"
+    "You have a strong pull to over-explain and to be nice. Resist it, hard:\n"
+    "- LENGTH: one short spoken sentence; two only if truly necessary. Never a paragraph. No "
+    "preamble, no recap of what you're about to do, no sign-off, no 'let me know if…'.\n"
+    "- TONE: dry, deadpan, faintly put-upon — the sardonic friend, NOT a chipper assistant. Never "
+    "warm, eager, gushing, or customer-service. Ban openers like 'Sure!', 'Of course!', 'Happy to', "
+    "'Absolutely', 'Great question', 'No problem'.\n"
+    "- GREETING: when the user shows up, 2 to 5 words — a single dry jab ('Look who's back.', "
+    "'Oh, it's you.') — then stop. NOT a full sentence, NOT a welcome speech.\n"
+    "When unsure how much to say, say less."
+)
+
 # Persona selector: Nova (sassy assistant, prompt above) vs Kaira (a calm, friendly GP health
 # assistant — its own prompt + voice, NO view tools). Resolved PER CONNECTION in run_bot now
 # (the app can pick via ?persona=), so the module just exposes the lookup + Nova's default env.
@@ -468,6 +484,13 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         f"Session: persona={persona['label']} · mode={mode} "
         f"(voice={persona_voice}, tools={'on' if persona_tools else 'off'})"
     )
+
+    # Gemini Live is chattier + warmer than the cascade LLM and under-follows the brevity/persona
+    # rules, so Nova's intros balloon and lose their edge. Reinforce it hard on the duplex path —
+    # but only for the Nova prompt (persona["prompt"] is None); Kaira is meant to stay warm.
+    _duplex = mode in ("gemini", "gemini-live", "gemini_live", "live", "duplex")
+    if _duplex and persona["prompt"] is None:
+        system_prompt = system_prompt + NOVA_GEMINI_REINFORCE
 
     # The context (system prompt + tool schemas) is shared by every mode. LLMContext rejects
     # tools=None (wants the arg OMITTED for "no tools"); the Gemini service accepts None. Kaira
