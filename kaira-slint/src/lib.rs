@@ -26,6 +26,8 @@ mod ios_photos;
 mod ios_web;
 #[cfg(target_os = "ios")]
 mod ios_video;
+#[cfg(target_os = "ios")]
+mod ios_haptics;
 // Talk (realtime WebRTC) runs on Android + iOS. Lab (sherpa STT/TTS) is Android-only.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod realtime;
@@ -1691,6 +1693,8 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         move || {
             if let Some(ui) = w.upgrade() {
                 let now = !ui.get_rt_connected();
+                #[cfg(target_os = "ios")]
+                ios_haptics::tap();
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     if now {
@@ -1752,6 +1756,8 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         let realtime = realtime.clone();
         move || {
             if let Some(ui) = w.upgrade() {
+                #[cfg(target_os = "ios")]
+                ios_haptics::tap();
                 #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     if ui.get_rt_connected() {
@@ -1792,6 +1798,8 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let realtime = realtime.clone();
         move |muted| {
+            #[cfg(target_os = "ios")]
+            ios_haptics::tap();
             #[cfg(any(target_os = "android", target_os = "ios"))]
             realtime.set_muted(muted);
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1862,6 +1870,8 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let realtime = realtime.clone();
         move || {
+            #[cfg(target_os = "ios")]
+            ios_haptics::tap();
             #[cfg(any(target_os = "android", target_os = "ios"))]
             realtime.interrupt();
         }
@@ -1876,6 +1886,24 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
     });
 
     // Open a URL (product store page, map location, …) in the phone's default handler.
+    // Tap a place in the map list → fly the interactive map to it (iOS). Other platforms have no
+    // live map, so fall back to the system Maps app (the previous behaviour).
+    ui.on_focus_pin(move |lat, lng| {
+        if lat == 0.0 && lng == 0.0 {
+            return;
+        }
+        #[cfg(target_os = "ios")]
+        ios_map::focus(lat as f64, lng as f64);
+        #[cfg(target_os = "android")]
+        {
+            let _ = crate::native_stt::launch_url(&format!(
+                "https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+            ));
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        eprintln!("[focus-pin] {lat},{lng}");
+    });
+
     ui.on_open_url(move |url| {
         let url = url.to_string();
         if !url.is_empty() {
@@ -2041,6 +2069,17 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                 .unwrap_or(false);
             ios_map::set_hidden(obscured || !on_map);
         });
+    }
+
+    // iOS: mirror the OS "Reduce Motion" accessibility setting so the looping idle animations
+    // (breathing avatars, pulses) go still for users who ask for less motion. Read once at start.
+    #[cfg(target_os = "ios")]
+    {
+        extern "C" {
+            fn UIAccessibilityIsReduceMotionEnabled() -> bool;
+        }
+        let reduce = unsafe { UIAccessibilityIsReduceMotionEnabled() };
+        ui.global::<VS>().set_reduce_motion(reduce);
     }
 
     // iOS: real in-app web reader — a WKWebView positioned to the web content region, hidden

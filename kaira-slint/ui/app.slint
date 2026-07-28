@@ -72,6 +72,9 @@ export global VS {
     in-out property <string> rail-pos: "right";   // which side the view-switcher rail sits on: "left" | "right"
     in-out property <bool> settings-open: false;   // the settings sheet (opened from the gear)
     in-out property <bool> addmenu-open: false;    // the "add a view" sheet (opened from the + button)
+    // Mirror of the OS "Reduce Motion" accessibility setting (set from Rust). Looping/idle
+    // animations (breathe, pulses) go still when true; transient transitions stay.
+    in-out property <bool> reduce-motion: false;
 
     // --- onboarding + permissions (see src/permissions.rs) ---
     in-out property <bool> onboarding-open: false;  // first-run intro + permission-priming overlay
@@ -197,6 +200,7 @@ export global Ico {
     pure public function path(id: string) -> string {
         return id == "images" ? images
             : id == "web" ? web
+            : id == "videos" ? video
             : id == "map" ? map
             : id == "products" ? shop
             : id == "docs" ? docs
@@ -259,7 +263,7 @@ component WorkingPill inherits Rectangle {
     property <bool> pulse: false;
     Timer {
         interval: 600ms;
-        running: true;
+        running: !VS.reduce-motion;
         triggered => { root.pulse = !root.pulse; }
     }
     VerticalLayout {
@@ -293,7 +297,7 @@ component PausedWave inherits Rectangle {
     property <bool> breathe: false;
     Timer {
         interval: 640ms;
-        running: true;
+        running: !VS.reduce-motion;
         triggered => { root.breathe = !root.breathe; }
     }
     HorizontalLayout {
@@ -479,13 +483,107 @@ component SwitchBtn inherits Rectangle {
     }
 }
 
+// Full-screen agent control, drawn as the live persona avatar (replaces the plain power icon):
+// breathes, tracks Kaira's talk frames, pulses on your mic, persona-accent ring when connected.
+// Disconnected → tap connects. Connected → tap pauses/unpauses (and barges in if she's mid-
+// sentence); hold (long-press) disconnects. A grey ring + dim shows the paused state.
+component RailAgentBtn inherits Rectangle {
+    in property <bool> connected;
+    in property <bool> talking;                  // agent-active
+    in property <bool> listening;                // mic-active
+    in property <int> frame;                     // kaira-frame
+    in property <[image]> talk-frames;           // kaira-talk
+    callback connect-toggle();                   // connect / disconnect the realtime session
+    callback mic-mute(bool);                     // pause (true) / unpause (false)
+    callback interrupt();                        // barge-in while she's talking
+    property <bool> paused: root.connected && VS.mic-muted;
+    property <bool> did-long: false;
+    width: 48px;
+    height: 48px;
+    property <bool> breathe: false;
+    Timer {
+        interval: 2200ms;
+        running: !VS.reduce-motion;
+        triggered => { root.breathe = !root.breathe; }
+    }
+    hold := Timer {
+        interval: 500ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            root.did-long = true;
+            if (root.connected) { root.connect-toggle(); }   // hold → disconnect
+        }
+    }
+    Rectangle {
+        width: 40px;
+        height: 40px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 20px;
+        background: ta.pressed ? VS.url-bg : transparent;
+        border-width: root.connected ? 1.5px : 0px;
+        border-color: root.paused ? VS.switchoff : Persona.accent;
+        animate border-width, border-color { duration: 200ms; }
+    }
+    Image {
+        width: ((root.breathe && !VS.reduce-motion) ? 34px : 31px) + (root.listening ? 3px : 0px);
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: Persona.index == 1
+            ? (root.talking && root.frame < root.talk-frames.length ? root.talk-frames[root.frame] : @image-url("../assets/kaira/idle.png"))
+            : @image-url("../assets/agent_icon_orange.svg");
+        image-fit: contain;
+        opacity: root.paused ? 0.5 : (root.connected ? 1.0 : 0.55);
+        animate width { duration: 1600ms; easing: ease-in-out; }
+        animate opacity { duration: 300ms; }
+    }
+    // paused badge — two little bars, so "paused" reads even with the strip hidden in full-screen
+    if root.paused: Rectangle {
+        width: 16px;
+        height: 16px;
+        x: parent.width - self.width - 2px;
+        y: parent.height - self.height - 2px;
+        border-radius: 8px;
+        background: VS.switchoff;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 2px;
+            Rectangle { width: 2px; height: 7px; border-radius: 1px; background: white; y: (parent.height - self.height) / 2; }
+            Rectangle { width: 2px; height: 7px; border-radius: 1px; background: white; y: (parent.height - self.height) / 2; }
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            if (!root.did-long) {
+                if (!root.connected) { root.connect-toggle(); }                       // tap → connect
+                else if (VS.mic-muted) { VS.mic-muted = false; root.mic-mute(false); } // unpause
+                else if (root.talking) { root.interrupt(); }                          // barge-in
+                else { VS.mic-muted = true; root.mic-mute(true); }                    // pause
+            }
+            root.did-long = false;
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) { root.did-long = false; hold.running = true; }
+            if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) { hold.running = false; }
+        }
+    }
+}
+
 // The view-switcher rail, extracted so it can sit on either side of the view (movable rail).
 // View state comes from VS globals; the realtime controls are forwarded from MainWindow.
 component SwitcherRail inherits VerticalLayout {
     in property <bool> on-left;          // true → the +menu opens toward the view (to the right)
     in property <bool> rt-connected;
+    in property <bool> rt-agent-active;  // forwarded from MainWindow so the avatar can animate
+    in property <bool> rt-mic-active;
+    in property <int> rt-frame;
+    in property <[image]> rt-talk;
     callback realtime-toggle();
     callback mic-mute(bool);
+    callback interrupt-nova();
+    callback pick-image();
     width: 48px;
     spacing: 8px;
     alignment: stretch;
@@ -494,11 +592,17 @@ component SwitcherRail inherits VerticalLayout {
         active: VS.fullscreen;
         tapped => { VS.fullscreen = !VS.fullscreen; }
     }
-    // in full-screen the bottom bar + strip are gone, so surface the essentials here
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.power;
-        active: root.rt-connected;
-        tapped => { root.realtime-toggle(); }
+    // in full-screen the bottom bar + strip are gone, so surface the essentials here.
+    // The agent avatar is the control: tap connects / pauses+unpauses, hold disconnects.
+    if VS.fullscreen: RailAgentBtn {
+        connected: root.rt-connected;
+        talking: root.rt-agent-active;
+        listening: root.rt-mic-active;
+        frame: root.rt-frame;
+        talk-frames: root.rt-talk;
+        connect-toggle => { root.realtime-toggle(); }
+        mic-mute(m) => { root.mic-mute(m); }
+        interrupt => { root.interrupt-nova(); }
     }
     if VS.fullscreen: SwitchBtn {
         d: Ico.mic;
@@ -507,7 +611,7 @@ component SwitcherRail inherits VerticalLayout {
     }
     if VS.fullscreen: SwitchBtn {
         d: Ico.attach;
-        tapped => { }
+        tapped => { root.pick-image(); }
     }
     Rectangle { width: 20px; height: 1px; background: VS.line; }
     Flickable {
@@ -547,8 +651,14 @@ component SwitcherRail inherits VerticalLayout {
 component SwitcherRailH inherits HorizontalLayout {
     in property <bool> drop-down;        // true (top rail) → the +menu opens downward; else upward
     in property <bool> rt-connected;
+    in property <bool> rt-agent-active;
+    in property <bool> rt-mic-active;
+    in property <int> rt-frame;
+    in property <[image]> rt-talk;
     callback realtime-toggle();
     callback mic-mute(bool);
+    callback interrupt-nova();
+    callback pick-image();
     height: 48px;
     spacing: 8px;
     alignment: stretch;
@@ -557,10 +667,15 @@ component SwitcherRailH inherits HorizontalLayout {
         active: VS.fullscreen;
         tapped => { VS.fullscreen = !VS.fullscreen; }
     }
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.power;
-        active: root.rt-connected;
-        tapped => { root.realtime-toggle(); }
+    if VS.fullscreen: RailAgentBtn {
+        connected: root.rt-connected;
+        talking: root.rt-agent-active;
+        listening: root.rt-mic-active;
+        frame: root.rt-frame;
+        talk-frames: root.rt-talk;
+        connect-toggle => { root.realtime-toggle(); }
+        mic-mute(m) => { root.mic-mute(m); }
+        interrupt => { root.interrupt-nova(); }
     }
     if VS.fullscreen: SwitchBtn {
         d: Ico.mic;
@@ -569,7 +684,7 @@ component SwitcherRailH inherits HorizontalLayout {
     }
     if VS.fullscreen: SwitchBtn {
         d: Ico.attach;
-        tapped => { }
+        tapped => { root.pick-image(); }
     }
     Rectangle { width: 1px; height: 20px; background: VS.line; y: (parent.height - self.height) / 2; }
     Flickable {
@@ -606,6 +721,7 @@ component SwitcherRailH inherits HorizontalLayout {
 // horizontal (left/right rail) or vertical (top/bottom rail) view-zone layout.
 component ActiveView inherits Rectangle {
     callback open-url(string);
+    callback focus-pin(float, float);   // tap a place in the list → fly the map to it (lat, lng)
     callback report-map-geom(length, length, length, length);
     callback report-web-geom(length, length, length, length);
     callback report-video-geom(length, length, length, length);
@@ -829,7 +945,6 @@ component ActiveView inherits Rectangle {
                                     property <length> half-h: mapRoot.height * 0.44;
                                     property <length> full-h: mapRoot.height * 0.82;
                                     property <length> sheet-h: 120px;
-                                    property <length> drag-start-h;
                                     property <bool> dragging: false;
                                     property <bool> route: VS.map-nav-url != "";
                                     // query chip — a floating-looking pill instead of a full bar + divider
@@ -999,8 +1114,11 @@ component ActiveView inherits Rectangle {
                                                                 Text { text: p.dist; color: VS.ink3; font-size: 11px; horizontal-alignment: right; }
                                                             }
                                                         }
-                                                        // tap a place → open it in the phone's Maps app
-                                                        TouchArea { clicked => { if (p.lat != 0) { root.open-url("https://www.google.com/maps/search/?api=1&query=\{p.lat},\{p.lng}"); } } }
+                                                        // tap a place → fly the in-app map to it
+                                                        // (the drawer stays put at its current height).
+                                                        TouchArea { clicked => {
+                                                            if (p.lat != 0) { root.focus-pin(p.lat, p.lng); }
+                                                        } }
                                                     }
                                                 }
                                             }
@@ -1013,7 +1131,6 @@ component ActiveView inherits Rectangle {
                                             pointer-event(e) => {
                                                 if (e.kind == PointerEventKind.down) {
                                                     mapRoot.dragging = true;
-                                                    mapRoot.drag-start-h = mapRoot.sheet-h;
                                                 }
                                                 if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) {
                                                     mapRoot.dragging = false;
@@ -1026,8 +1143,12 @@ component ActiveView inherits Rectangle {
                                             }
                                             moved => {
                                                 if (mapRoot.dragging) {
+                                                    // Drive the height from the pointer's ABSOLUTE y, not a delta relative
+                                                    // to this handle: the handle rides the sheet as it resizes, so a relative
+                                                    // delta feeds back into the size and oscillates (the jitter). Keep the
+                                                    // grabbed point under the finger: sheet top = pointerY − grab-offset.
                                                     mapRoot.sheet-h = clamp(
-                                                        mapRoot.drag-start-h - (self.mouse-y - self.pressed-y),
+                                                        mapRoot.height - (self.absolute-position.y + self.mouse-y - self.pressed-y - mapRoot.absolute-position.y),
                                                         mapRoot.closed-h, mapRoot.full-h);
                                                 }
                                             }
@@ -1667,6 +1788,15 @@ export component MainWindow inherits Window {
         else { agent-hold-timer.running = true; }
     }
     property <bool> user-active: root.rt-mic-level > 0.03 && !root.agent-active;
+    // "Nova is thinking": the gap after you stop talking and before she replies. Heuristic —
+    // 500ms after your voice drops (debounces mid-sentence pauses), if it's still quiet and
+    // she hasn't started, show it; cleared when she speaks, you speak again, or after 8s.
+    property <bool> thinking: false;
+    changed user-active => {
+        if (root.user-active) { root.thinking = false; thinking-delay.running = false; }
+        else if (root.rt-live && !root.agent-active) { thinking-delay.running = true; }
+    }
+    changed agent-active => { if (root.agent-active) { root.thinking = false; } }
     // Kaira talking-animation frame cursor (advanced by kaira-talk-timer while she speaks).
     property <int> kaira-frame: 0;
     property <[image]> kaira-talk: [
@@ -1716,6 +1846,7 @@ export component MainWindow inherits Window {
     changed lb-track-open => { root.view-image(VS.lightbox-open ? VS.lightbox-index : -1); }
     callback mic-mute(bool);    // mute/unmute the outbound mic on the realtime client
     callback open-url(string);  // open a URL in the phone (product store page, map location, …)
+    callback focus-pin(float, float);  // tap a place in the list → fly the interactive map to it (lat, lng)
     callback interrupt-nova();  // tap the waveform to cut Nova off mid-sentence
     callback pick-image();      // tap the upload button → open the iOS photo picker
     callback save-setting(string, string);  // persist a setting (key, value) to the app's files dir
@@ -1733,6 +1864,24 @@ export component MainWindow inherits Window {
         interval: 500ms;
         running: false;
         triggered => { root.agent-active = false; self.running = false; }
+    }
+    // Debounce before showing "thinking" (ignores brief mid-sentence gaps in your speech).
+    thinking-delay := Timer {
+        interval: 500ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if (!root.user-active && !root.agent-active && root.rt-live) {
+                root.thinking = true;
+                thinking-timeout.running = true;
+            }
+        }
+    }
+    // Safety valve so "thinking" never sticks if she stays silent (e.g. a dropped turn).
+    thinking-timeout := Timer {
+        interval: 8s;
+        running: false;
+        triggered => { root.thinking = false; self.running = false; }
     }
     // Advances Kaira's talking frames (~11fps) while she is actually speaking.
     kaira-talk-timer := Timer {
@@ -1801,7 +1950,7 @@ export component MainWindow inherits Window {
                         }
                         Timer {
                             interval: 2200ms;
-                            running: true;
+                            running: !VS.reduce-motion;
                             triggered => { agentPresence.breathe = !agentPresence.breathe; }
                         }
                         // persona-tinted glow behind the orb (violet=Nova, green=Kaira); expands +
@@ -1902,6 +2051,7 @@ export component MainWindow inherits Window {
                                         : root.agent-active ? "\{Persona.name-upper} — TAP TO STOP"
                                         : VS.mic-muted ? "PAUSED — TAP WAVEFORM TO RESUME"
                                         : root.user-active ? "YOU"
+                                        : root.thinking ? "\{Persona.name-upper} IS THINKING…"
                                         : "TALKING";
                                     color: #ffffffee;
                                     font-size: 11px;
@@ -1920,7 +2070,7 @@ export component MainWindow inherits Window {
                                         property <bool> mbreathe: false;
                                         Timer {
                                             interval: 2200ms;
-                                            running: true;
+                                            running: !VS.reduce-motion;
                                             triggered => { miniAgent.mbreathe = !miniAgent.mbreathe; }
                                         }
                                         HorizontalLayout {
@@ -2095,14 +2245,22 @@ export component MainWindow inherits Window {
                             spacing: VS.gap-sm;
                             if VS.rail-pos == "left": SwitcherRail {
                                 on-left: true; rt-connected: root.rt-connected;
+                                rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
+                                rt-frame: root.kaira-frame; rt-talk: root.kaira-talk;
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
+                                interrupt-nova => { root.interrupt-nova(); }
+                                pick-image => { root.pick-image(); }
                             }
-                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "right": SwitcherRail {
                                 on-left: false; rt-connected: root.rt-connected;
+                                rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
+                                rt-frame: root.kaira-frame; rt-talk: root.kaira-talk;
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
+                                interrupt-nova => { root.interrupt-nova(); }
+                                pick-image => { root.pick-image(); }
                             }
                         }
                         if VS.rail-pos == "top" || VS.rail-pos == "bottom": VerticalLayout {
@@ -2114,84 +2272,25 @@ export component MainWindow inherits Window {
                             spacing: VS.gap-sm;
                             if VS.rail-pos == "top": SwitcherRailH {
                                 drop-down: true; rt-connected: root.rt-connected;
+                                rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
+                                rt-frame: root.kaira-frame; rt-talk: root.kaira-talk;
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
+                                interrupt-nova => { root.interrupt-nova(); }
+                                pick-image => { root.pick-image(); }
                             }
-                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
                             if VS.rail-pos == "bottom": SwitcherRailH {
                                 drop-down: false; rt-connected: root.rt-connected;
+                                rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
+                                rt-frame: root.kaira-frame; rt-talk: root.kaira-talk;
                                 realtime-toggle => { root.realtime-toggle(); }
                                 mic-mute(m) => { root.mic-mute(m); }
+                                interrupt-nova => { root.interrupt-nova(); }
+                                pick-image => { root.pick-image(); }
                             }
                         }
 
-                        // full-screen agent indicator: a circular waveform (radial bars from the live
-                        // level, orange = Nova, teal = you) that shows who's talking now that the strip
-                        // is hidden. One-tap control: Nova talking → stop; listening → pause; paused → resume.
-                        if VS.fullscreen && root.rt-connected: fscircle := Rectangle {
-                            property <bool> paused: VS.mic-muted;
-                            property <bool> nova: root.agent-active;
-                            property <bool> you: root.user-active;
-                            width: 132px;
-                            height: 132px;
-                            x: (parent.width - self.width) / 2;
-                            y: 12px;
-                            // backdrop disc + radial waveform
-                            Rectangle {
-                                width: 108px;
-                                height: 108px;
-                                x: (parent.width - self.width) / 2;
-                                y: 0;
-                                border-radius: 54px;
-                                background: VS.dark ? #1c1f28e6 : #ffffffe6;
-                                drop-shadow-blur: 12px;
-                                drop-shadow-color: #00000033;
-                                // ring of dots placed with sin/cos (Slint has no element rotation);
-                                // each dot's size tracks the level at that point in the rolling history.
-                                for v[i] in root.wave: Rectangle {
-                                    property <angle> a: i * 360deg / root.wave.length;
-                                    property <length> sz: 3px + 9px * min(1.0, abs(v) * 2.2);
-                                    width: self.sz;
-                                    height: self.sz;
-                                    border-radius: self.sz / 2;
-                                    x: parent.width / 2 + 38px * cos(self.a) - self.sz / 2;
-                                    y: parent.height / 2 + 38px * sin(self.a) - self.sz / 2;
-                                    background: v > 0.06 ? VS.orange : (v < -0.06 ? VS.speaker-user : (VS.dark ? #3a3f4d : #d3d8e2));
-                                    animate width, height { duration: 90ms; easing: ease-out; }
-                                }
-                                // center dot — grows/colours with the current speaker
-                                Rectangle {
-                                    width: fscircle.paused ? 10px : (fscircle.nova || fscircle.you ? 15px : 11px);
-                                    height: self.width;
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    border-radius: self.width / 2;
-                                    background: fscircle.paused ? #6b7185 : (fscircle.nova ? VS.orange : (fscircle.you ? VS.speaker-user : #c9cfda));
-                                    animate width { duration: 150ms; easing: ease-out; }
-                                }
-                            }
-                            // caption
-                            Text {
-                                text: fscircle.paused ? "PAUSED — TAP TO RESUME"
-                                    : (fscircle.nova ? "NOVA — TAP TO STOP"
-                                    : (fscircle.you ? "LISTENING" : "TAP TO PAUSE"));
-                                color: fscircle.paused ? VS.ink3 : (fscircle.nova ? VS.orange : VS.speaker-user);
-                                font-size: 10px;
-                                font-weight: 700;
-                                letter-spacing: 1px;
-                                horizontal-alignment: center;
-                                width: 220px;
-                                x: (parent.width - self.width) / 2;
-                                y: 112px;
-                            }
-                            TouchArea {
-                                clicked => {
-                                    if (VS.mic-muted) { VS.mic-muted = false; root.mic-mute(false); }
-                                    else if (root.agent-active) { root.interrupt-nova(); }
-                                    else { VS.mic-muted = true; root.mic-mute(true); }
-                                }
-                            }
-                        }
                     }
 
                     // ===== controls (hidden in full-screen — they move into the rail) =====
@@ -2455,6 +2554,7 @@ export component MainWindow inherits Window {
                             for v in [
                                 { id: "chat", label: "Chat" },
                                 { id: "images", label: "Images" },
+                                { id: "videos", label: "Videos" },
                                 { id: "web", label: "Web" },
                                 { id: "map", label: "Map" },
                                 { id: "products", label: "Shopping" },

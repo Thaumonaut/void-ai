@@ -65,6 +65,8 @@ const MAPBOX_HTML: &str = r#"<!doctype html><html><head>
    if(!centered){ map.jumpTo({center:userLoc,zoom:14}); centered=true; }
  };
  window.recenter=function(){ if(userLoc){ showErr(''); map.flyTo({center:userLoc,zoom:15,duration:600}); } else { showErr('finding your location… (grant Location if you haven\'t)'); } };
+ // Tapping a place in the list flies the map to it and zooms in.
+ window.focusPin=function(lng,lat){ centered=true; map.flyTo({center:[lng,lat],zoom:16,duration:700}); };
  map.on('load',function(){ ready=true; if(pending){ apply(pending); pending=null; } });
  window.updateMap=function(d){ if(!ready){ pending=d; return; } apply(d); };
  function clearMarkers(){ markers.forEach(function(m){ m.remove(); }); markers=[]; }
@@ -222,6 +224,18 @@ pub fn show_at(window: &slint::Window, x: f32, y: f32, w: f32, h: f32) {
         push_user();
         // Apply any map data that arrived before the webview existed.
         apply_pending();
+    }
+}
+
+/// Fly the interactive map to a place tapped in the list and zoom in. No-op if the webview
+/// isn't up yet; `window.focusPin` guards its own readiness.
+pub fn focus(lat: f64, lng: f64) {
+    unsafe {
+        MAP_WEBVIEW.with(|m| {
+            if let Some(wv) = m.borrow().as_ref() {
+                eval_js(&**wv, &format!("window.focusPin&&window.focusPin({lng},{lat});"));
+            }
+        });
     }
 }
 
