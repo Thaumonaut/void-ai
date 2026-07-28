@@ -21,6 +21,13 @@ export CARGO_PROFILE_RELEASE_DEBUG="${CARGO_PROFILE_RELEASE_DEBUG:-1}"
 # (webrtc + skia = ~15 GB) from scratch every clean build — slow, and it filled the disk.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SRCROOT/target}"
 
+# Bake the backend auth token from the gitignored ../.env.local into the build (realtime.rs reads
+# it via option_env!), so the app can reach a protected backend. Absent (fresh clone) → empty →
+# point that build at your own backend.
+if [ -z "${BOT_AUTH_TOKEN:-}" ] && [ -f "$SRCROOT/../.env.local" ]; then
+    export BOT_AUTH_TOKEN="$(grep -E '^BOT_AUTH_TOKEN=' "$SRCROOT/../.env.local" | head -1 | cut -d= -f2-)"
+fi
+
 IS_SIMULATOR=0
 if [ "${LLVM_TARGET_TRIPLE_SUFFIX-}" = "-simulator" ]; then IS_SIMULATOR=1; fi
 

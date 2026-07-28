@@ -87,9 +87,11 @@ cargo run                                   # desktop (fast UI iteration; realti
   `realtime_url*.txt` file in the app’s files dir.
 - **Android:** `cargo apk` + `./deploy.sh` (see [`kaira-slint/README.md`](kaira-slint/README.md)).
 
-> **Sharing note:** the app defaults to a demo backend IP with **no auth** — anyone with the app
-> can use those bots (and the keys behind them). To share widely, run **your own** backend and
-> point the app at it, or add auth first (see `openspec/changes/secure-bot-endpoint`).
+> **Backend auth:** the bot requires a shared token (`BOT_AUTH_TOKEN`) on `/api/offer` when that
+> env is set, and the app sends it — **baked in at build time from your gitignored `.env.local`,
+> never committed.** A fresh clone therefore has no token and can't hit the maintainer's demo
+> backend (it gets `403`); set your own `BOT_AUTH_TOKEN` on both the bot (its `.env`) and the app
+> build (`.env.local`), or point the app at your own backend.
 
 ---
 

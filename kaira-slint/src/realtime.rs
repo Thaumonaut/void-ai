@@ -112,6 +112,14 @@ pub enum Cmd {
 // User mute: when true the pump sends silence instead of the mic (single active
 // session, so a module-level flag is simpler than threading an Arc through the pump).
 static MUTED: AtomicBool = AtomicBool::new(false);
+
+// Backend auth token, baked in at BUILD time from the gitignored .env.local (BOT_AUTH_TOKEN) — so a
+// protected/droplet bot accepts us, but the token never lands in committed source. Empty in a fresh
+// public-repo build → that build must point at its own (unprotected) backend.
+const BOT_TOKEN: &str = match option_env!("BOT_AUTH_TOKEN") {
+    Some(t) => t,
+    None => "",
+};
 // True while Nova's audio is actually still coming out of the speaker (sink not empty).
 // The mic pump gates on this so the speaker's playout tail can't echo back into the mic
 // and make her interrupt herself — precise, not a fixed guess.
@@ -644,6 +652,7 @@ async fn run_attempt(
         .unwrap_or_else(|_| reqwest::Client::new());
     let resp = match client
         .post(url)
+        .header("x-bot-token", BOT_TOKEN)
         .json(&serde_json::json!({ "sdp": local.sdp, "type": "offer" }))
         .send()
         .await

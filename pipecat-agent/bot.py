@@ -264,6 +264,26 @@ async def _ice_servers():
     return _fetch_turn_raw() or {"iceServers": []}
 
 
+# ---- Endpoint auth ---------------------------------------------------------------------------
+# When BOT_AUTH_TOKEN is set (production / droplet), starting a session requires a matching token
+# (header `x-bot-token`, or `?token=`), so a PUBLIC repo exposing the droplet IP can't be abused by
+# strangers burning the API keys. Unset (local dev) = open. The token is NEVER in committed source:
+# the app bakes it in at build time from the gitignored .env.local; anyone else runs their own bot.
+_BOT_AUTH_TOKEN = os.getenv("BOT_AUTH_TOKEN")
+if _BOT_AUTH_TOKEN:
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    @_runner_app.middleware("http")
+    async def _require_bot_token(request, call_next):
+        if request.url.path.rstrip("/") in ("/api/offer", "/ice"):
+            tok = request.headers.get("x-bot-token") or request.query_params.get("token")
+            if tok != _BOT_AUTH_TOKEN:
+                return _JSONResponse({"error": "unauthorized"}, status_code=403)
+        return await call_next(request)
+
+    logger.info("Endpoint auth ENABLED — /api/offer + /ice require BOT_AUTH_TOKEN")
+
+
 class ReliableSonioxTTSService(SonioxTTSService):
     """Soniox TTS that opens the per-stream config LAZILY (right before the first
     text of a turn) instead of eagerly at LLMFullResponseStartFrame.
