@@ -27,6 +27,8 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import TTSSpeakFrame
 
+import memory  # per-user fact store (remember / recall / forget)
+
 # Read keys at CALL time (not import time) — load_dotenv() runs after this module
 # may already be imported, so module-level os.getenv would capture None.
 def _mapbox():
@@ -256,12 +258,15 @@ async def _geocode(place, near=None):
 
 
 # ------------------------------------------------------------------------- the tools
-def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
+def register_tool_handlers(llm, ui, task, speak_filler: bool = True, user_id: str = "default"):
     """Bind the handlers to this run's UiBridge + task and register them on the LLM.
 
     speak_filler: cascade mode pushes a TTSSpeakFrame filler line to cover the
     tool-fetch gap. In full-duplex/S2S mode (Ultravox) there is no TTS service in
     the pipeline and the S2S model covers the gap itself, so we skip it.
+
+    user_id: keys the per-user memory store for remember/recall/forget (single dev
+    key until secure-bot-endpoint supplies real per-user ids).
     """
 
     async def _filler(name):
@@ -430,6 +435,48 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
         except Exception as e:
             logger.exception("search_images failed")
             await params.result_callback({"error": f"Image search choked: {e}"})
+
+    async def search_videos(params):
+        q = (params.arguments or {}).get("query", "")
+        await _filler("search_videos")
+        if not _serpapi():
+            await params.result_callback({"error": "Video search isn't set up yet (no SERPAPI_API_KEY)."})
+            return
+        try:
+            # YouTube via SerpApi → a browsable grid; each item plays in the app's embed player.
+            data = await _get_json("https://serpapi.com/search", params={
+                "engine": "youtube", "search_query": q, "api_key": _serpapi(),
+            })
+            items = []
+            for r in data.get("video_results", [])[:20]:
+                link = r.get("link", "")
+                vid = ""
+                if "watch?v=" in link:
+                    vid = link.split("watch?v=", 1)[1].split("&", 1)[0]
+                elif "/shorts/" in link:
+                    vid = link.split("/shorts/", 1)[1].split("?", 1)[0]
+                if not vid:
+                    continue  # need the id to build the embed player
+                t = r.get("thumbnail")
+                thumb = (t.get("static") or t.get("rich") or "") if isinstance(t, dict) else (t or "")
+                ch = r.get("channel")
+                channel = ch.get("name", "") if isinstance(ch, dict) else (ch or "")
+                items.append({
+                    "title": (r.get("title") or q)[:80],
+                    "channel": (channel or "")[:40],
+                    "dur": r.get("length") or "",
+                    "url": link,
+                    "id": vid,
+                    "thumb": thumb,
+                })
+            if not items:
+                await params.result_callback({"error": f"No videos found for '{q}'."})
+                return
+            await ui.videos(items=items, query=q)
+            await params.result_callback({"summary": f"Found {len(items)} videos for '{q}'."})
+        except Exception as e:
+            logger.exception("search_videos failed")
+            await params.result_callback({"error": f"Video search choked: {e}"})
 
     async def search_products(params):
         q = (params.arguments or {}).get("query", "")
@@ -624,15 +671,47 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
             logger.exception("find_specialist failed")
             await params.result_callback({"error": f"I couldn't complete the specialist search: {e}"})
 
+    # ---- memory: remember / recall / forget (local + instant → no filler) ----
+    async def remember(params):
+        args = params.arguments or {}
+        fact = (args.get("fact") or "").strip()
+        category = (args.get("category") or "preference").strip().lower()
+        saved = memory.add(user_id, fact, category)
+        if not saved:
+            await params.result_callback({"error": "There was nothing to remember."})
+            return
+        await params.result_callback({"summary": f"Noted and saved: {saved['text']}"})
+
+    async def recall(params):
+        q = (params.arguments or {}).get("query", "")
+        hits = memory.query(user_id, q)
+        if not hits:
+            miss = f"Nothing stored about '{q}'." if q else "Nothing stored on that yet."
+            await params.result_callback({"summary": miss})
+            return
+        await params.result_callback({"summary": "; ".join(f["text"] for f in hits)})
+
+    async def forget(params):
+        match = (params.arguments or {}).get("fact", "")
+        removed = memory.remove(user_id, match)
+        if not removed:
+            await params.result_callback({"summary": f"Nothing matching '{match}' to forget."})
+            return
+        await params.result_callback({"summary": "Forgotten: " + "; ".join(f["text"] for f in removed)})
+
     llm.register_function("search_places", search_places)
     llm.register_function("search_web", search_web)
     llm.register_function("search_images", search_images)
+    llm.register_function("search_videos", search_videos)
     llm.register_function("search_products", search_products)
     llm.register_function("get_directions", get_directions)
     llm.register_function("start_navigation", start_navigation)
     llm.register_function("find_specialist", find_specialist)
-    logger.info("Registered tools: search_places, search_web, search_images, search_products, "
-                "get_directions, start_navigation, find_specialist")
+    llm.register_function("remember", remember)
+    llm.register_function("recall", recall)
+    llm.register_function("forget", forget)
+    logger.info("Registered tools: search_places, search_web, search_images, search_videos, "
+                "search_products, get_directions, start_navigation, find_specialist")
 
 
 # ---------------------------------------------------------------- schemas (pure data)
@@ -658,6 +737,14 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
         name="search_images",
         description="Show a grid of IMAGES for a subject. Use when the user wants to SEE what something looks like.",
         properties={"query": {"type": "string", "description": "What to show pictures of."}},
+        required=["query"],
+    ),
+    FunctionSchema(
+        name="search_videos",
+        description=("Show a grid of VIDEOS (YouTube) the user can play. Use when they want to WATCH something — "
+                     "a how-to, a clip, a trailer, a music video, a talk. Once one is playing you can SEE the "
+                     "video and answer questions about what's happening in it."),
+        properties={"query": {"type": "string", "description": "What videos to find, e.g. 'how to poach an egg'."}},
         required=["query"],
     ),
     FunctionSchema(
@@ -690,6 +777,34 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
                      "description": "Travel mode. Defaults to driving."},
         },
         required=["destination"],
+    ),
+    FunctionSchema(
+        name="remember",
+        description=("Save a lasting fact about the user to your memory so you still know it in future "
+                     "conversations — their name, tastes/preferences, the people and places in their life, "
+                     "routines, ongoing projects. Use it PROACTIVELY the moment the user shares something "
+                     "stable and worth keeping, without being asked. Confirm FIRST before saving anything "
+                     "sensitive (health, finances, relationships, a precise home address)."),
+        properties={
+            "fact": {"type": "string", "description": "The fact to remember, e.g. 'Lives in Ballard' or 'Hates cilantro'."},
+            "category": {"type": "string", "enum": list(memory.CATEGORIES),
+                         "description": "preference | person | place | routine | project."},
+        },
+        required=["fact"],
+    ),
+    FunctionSchema(
+        name="recall",
+        description=("Look something up in your memory of the user when you need a detail you might have stored "
+                     "before — a name, a preference, an address, a person in their life."),
+        properties={"query": {"type": "string", "description": "What to look up, e.g. 'coffee order' or 'sister'."}},
+        required=["query"],
+    ),
+    FunctionSchema(
+        name="forget",
+        description=("Remove a fact from your memory when the user asks you to forget it, or corrects something "
+                     "that has changed."),
+        properties={"fact": {"type": "string", "description": "The fact (or a phrase from it) to remove."}},
+        required=["fact"],
     ),
 ])
 

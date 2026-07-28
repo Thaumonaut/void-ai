@@ -23,6 +23,7 @@ from collections.abc import AsyncGenerator
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ui import UiBridge  # noqa: E402
 from tools import NOVA_TOOLS, register_tool_handlers, set_location  # noqa: E402
+import memory  # noqa: E402  — per-user fact store (injected at session start; grown via tools)
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -284,6 +285,26 @@ if _BOT_AUTH_TOKEN:
     logger.info("Endpoint auth ENABLED — /api/offer + /ice require BOT_AUTH_TOKEN")
 
 
+# Per-connection A/B selection: the app can pass ?persona=nova|kaira and ?mode=cascade|duplex|gemini
+# on /api/offer to choose the agent + pipeline for THAT session (falls back to the KAIRA_* env
+# defaults). Single sequential connection, so one slot captured in a middleware is enough. Runs
+# regardless of auth so local (token-less) dev works too.
+_REQ_SELECTION = {"persona": None, "mode": None, "uid": None}
+
+
+@_runner_app.middleware("http")
+async def _capture_session_selection(request, call_next):
+    if request.url.path.rstrip("/") == "/api/offer":
+        # Persona = ?agent= (preferred) or ?persona=. Engine comes from this bot's fixed KAIRA_MODE
+        # env (cascade bot vs duplex bot), but ?mode= can still override per-connection if sent.
+        _REQ_SELECTION["persona"] = request.query_params.get("agent") or request.query_params.get("persona")
+        _REQ_SELECTION["mode"] = request.query_params.get("mode")
+        # Per-user memory key. Not sent yet (secure-bot-endpoint will), so it falls back to a
+        # single dev key below — captured here so the wiring is ready when auth lands.
+        _REQ_SELECTION["uid"] = request.query_params.get("uid")
+    return await call_next(request)
+
+
 class ReliableSonioxTTSService(SonioxTTSService):
     """Soniox TTS that opens the per-stream config LAZILY (right before the first
     text of a turn) instead of eagerly at LLMFullResponseStartFrame.
@@ -358,23 +379,27 @@ SYSTEM_PROMPT = (
     "\n\nCONTEXT — TRACK the conversation. Follow-ups lean on what was just said or what's on "
     "screen — 'the cheaper one', 'what's that in feet?', 'why though?', 'what about downtown?' — "
     "resolve them against the conversation; never treat a question as if it arrived out of nowhere. "
+    "\n\nMEMORY — you actually know this user, across sessions, via three tools:\n"
+    "- remember(fact, category): save a lasting fact — their name, tastes, the people and places in "
+    "their life, routines, ongoing projects. Use it PROACTIVELY the moment they share something "
+    "stable and worth keeping; don't wait to be told. But CONFIRM first before saving anything "
+    "sensitive (health, finances, relationships, a precise home address).\n"
+    "- recall(query): look up something you may have stored before.\n"
+    "- forget(fact): drop a fact when they ask, or when something changed.\n"
+    "Anything loaded above under 'WHAT YOU REMEMBER ABOUT THIS USER' is what you already know — use "
+    "it naturally in conversation; never recite it back as a list. "
     "HARD RULES: playful only — never genuinely mean or cruel; never mock protected traits; always "
     "deliver the actual answer. Reply in ONE or two short spoken sentences. No markdown, lists, or "
     "emoji; you're read aloud, so keep it snappy."
 )
 
-# Persona selector: KAIRA_PERSONA=kaira swaps Nova (sassy assistant) for Kaira (a calm,
-# friendly GP health assistant that runs a standard clinical consultation) — its own prompt +
-# voice, and NO view tools (pure conversation). Nova's prompt stays above; personas.py carries
-# Kaira's prompt and each persona's voice/tools. GEMINI_VOICE still overrides the voice.
+# Persona selector: Nova (sassy assistant, prompt above) vs Kaira (a calm, friendly GP health
+# assistant — its own prompt + voice, NO view tools). Resolved PER CONNECTION in run_bot now
+# (the app can pick via ?persona=), so the module just exposes the lookup + Nova's default env.
+# personas.py carries Kaira's prompt and each persona's voice/tools; GEMINI_VOICE still overrides.
 from personas import get_persona as _get_persona  # noqa: E402
 
-_PERSONA = _get_persona(os.getenv("KAIRA_PERSONA", "nova"))
-if _PERSONA["prompt"]:
-    SYSTEM_PROMPT = _PERSONA["prompt"]
-PERSONA_VOICE = _PERSONA["voice"]
-PERSONA_TOOLS = _PERSONA["tools"]  # a ToolsSchema per persona (NOVA_TOOLS / KAIRA_TOOLS)
-logger.info(f"Persona: {_PERSONA['label']} (voice={PERSONA_VOICE}, tools={'on' if PERSONA_TOOLS else 'off'})")
+_DEFAULT_PERSONA = os.getenv("KAIRA_PERSONA", "nova")
 
 # ---- VAD tuning (this is what the realtime/VAD test is for) ----
 # start_secs: speech must persist this long before "user started talking" fires
@@ -419,18 +444,38 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     raw-WebSocket transport used by the Slint on-device client — see ws_bot.py)."""
     logger.info("Starting Kaira realtime bot")
 
-    # The context (system prompt + Nova's tool schemas) is shared by both modes.
-    # LLMContext rejects tools=None (wants the arg OMITTED for "no tools"); the Gemini service,
-    # by contrast, accepts None. Kaira runs tool-free (PERSONA_TOOLS=None) → omit tools here.
-    context = LLMContext(
-        [{"role": "system", "content": SYSTEM_PROMPT}],
-        **({"tools": PERSONA_TOOLS} if PERSONA_TOOLS else {}),
+    # Per-connection A/B selection: the app can send ?persona= and ?mode= on /api/offer to pick
+    # the agent + pipeline for THIS session (captured in the middleware above); else the KAIRA_*
+    # env defaults. Persona = prompt/voice/tools; mode = pipeline. Nova's prompt (the literal
+    # above) is the fallback for any persona whose own prompt is None.
+    persona = _get_persona((_REQ_SELECTION["persona"] or _DEFAULT_PERSONA).strip().lower())
+    system_prompt = persona["prompt"] or SYSTEM_PROMPT
+
+    # Per-user memory: prime the prompt with what we know about this user (name, home/work,
+    # people, preferences, and where we left off). Keyed by the authenticated user id once
+    # secure-bot-endpoint lands; a single dev key (MEMORY_USER_ID) stands in until then. An
+    # empty store returns "" → the prompt is byte-for-byte today's, so behaviour is unchanged.
+    user_id = (_REQ_SELECTION.get("uid") or os.getenv("MEMORY_USER_ID") or "default").strip() or "default"
+    _mem_block = memory.context_block(user_id)
+    if _mem_block:
+        system_prompt = f"{system_prompt}\n\n=== WHAT YOU REMEMBER ABOUT THIS USER ===\n{_mem_block}"
+        logger.info(f"Injected {len(_mem_block)} chars of memory for user '{user_id}'.")
+
+    persona_voice = persona["voice"]
+    persona_tools = persona["tools"]
+    mode = (_REQ_SELECTION["mode"] or os.getenv("KAIRA_MODE", "cascade")).strip().lower()
+    logger.info(
+        f"Session: persona={persona['label']} · mode={mode} "
+        f"(voice={persona_voice}, tools={'on' if persona_tools else 'off'})"
     )
 
-    # KAIRA_MODE picks the voice pipeline: "cascade" (default, Soniox+Gemma+Soniox) or
-    # "ultravox" (full-duplex S2S — one audio-native model replaces STT+LLM+TTS). Same
-    # tools + UiBridge either way, so it's a clean A/B on the same device.
-    mode = os.getenv("KAIRA_MODE", "cascade").strip().lower()
+    # The context (system prompt + tool schemas) is shared by every mode. LLMContext rejects
+    # tools=None (wants the arg OMITTED for "no tools"); the Gemini service accepts None. Kaira
+    # runs tool-free (persona_tools=None) → omit tools here.
+    context = LLMContext(
+        [{"role": "system", "content": system_prompt}],
+        **({"tools": persona_tools} if persona_tools else {}),
+    )
 
     if mode in ("ultravox", "realtime", "s2s"):
         logger.info("KAIRA_MODE=ultravox — full-duplex Ultravox Realtime pipeline")
@@ -439,7 +484,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         llm = UltravoxRealtimeLLMService(
             params=OneShotInputParams(
                 api_key=os.getenv("ULTRAVOX_API_KEY"),
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 output_medium="voice",
             ),
             one_shot_selected_tools=NOVA_TOOLS,  # schemas; handlers registered below
@@ -459,7 +504,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         # No TTS service in this pipeline; Ultravox covers the tool-fetch gap itself
         # (async placeholder), so skip the TTSSpeakFrame filler.
         speak_filler = False
-    elif mode in ("gemini", "gemini-live", "gemini_live", "live"):
+    elif mode in ("gemini", "gemini-live", "gemini_live", "live", "duplex"):
         # Gemini Live full-duplex S2S — one audio-native model replaces STT+LLM+TTS,
         # same tools + UiBridge as the other modes (clean A/B on the same device).
         # Model is env-overridable (GEMINI_LIVE_MODEL); NOTE the required `models/` prefix.
@@ -478,11 +523,11 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         _id_lang = os.getenv("GEMINI_LANG", "").lower() in ("id", "id-id", "indonesian")
         llm = GeminiLiveLLMService(
             api_key=gkey,
-            tools=PERSONA_TOOLS,  # None for Kaira (pure consultation); NOVA_TOOLS for Nova
+            tools=persona_tools,  # None for Kaira (pure consultation); NOVA_TOOLS for Nova
             settings=GeminiLiveLLMService.Settings(
                 model=gemini_model,
-                voice=os.getenv("GEMINI_VOICE") or PERSONA_VOICE,
-                system_instruction=SYSTEM_PROMPT,
+                voice=os.getenv("GEMINI_VOICE") or persona_voice,
+                system_instruction=system_prompt,
                 # Disable Gemini's SERVER-side VAD so our local Silero VAD (in the aggregator)
                 # is the SOLE turn authority — it sends Gemini explicit activity_start/end per
                 # turn. Running both VADs let turn 1 through but dropped turn 2: the browser
@@ -506,7 +551,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         # (cascade, before the LLM) hears you fine, but Gemini never receives audio. Tool RESULTS
         # still flow — the assistant aggregator writes them into this context as `tool` messages,
         # which is all _process_completed_function_calls reads to send them back to Gemini.
-        gemini_context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
+        gemini_context = LLMContext([{"role": "system", "content": system_prompt}])
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             gemini_context,
             user_params=LLMUserAggregatorParams(vad_analyzer=_VAD),
@@ -615,10 +660,41 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     ui = UiBridge(task)
     # Bind Nova's tools to this run's UiBridge + task; register handlers on the active
     # service (schemas already went on the context / one_shot tools).
-    register_tool_handlers(llm, ui, task, speak_filler=speak_filler)
+    register_tool_handlers(llm, ui, task, speak_filler=speak_filler, user_id=user_id)
 
     # Client → bot messages over the data channel. Currently: the phone's GPS, so every
     # place lookup + directions can start from where the user actually is.
+    # Vision: fetch the image the user is looking at, decode it, and push it into the pipeline as
+    # a video frame — GeminiLiveLLMService re-encodes it to JPEG and sends it as realtime video,
+    # so Nova can actually SEE it and answer questions about it. Duplex/Gemini only (cascade is
+    # text-only). Runs the blocking fetch+decode off the event loop.
+    _GEMINI_MODES = ("gemini", "gemini-live", "gemini_live", "live", "duplex")
+
+    async def _show_image_to_nova(url: str = "", b64: str = ""):
+        try:
+            def _load():
+                from PIL import Image
+                import base64 as _b64
+                import io as _pio
+
+                if b64:  # imported photo — base64 JPEG straight off the data channel
+                    raw = _b64.b64decode(b64)
+                else:  # searched image — fetch the URL
+                    req = _url.Request(url, headers={"User-Agent": "Mozilla/5.0 (VOID_AI)"})
+                    raw = _url.urlopen(req, timeout=8).read()
+                img = Image.open(_pio.BytesIO(raw)).convert("RGB")
+                img.thumbnail((1024, 1024))  # cap resolution — plenty for the model
+                return img.tobytes(), img.size
+
+            image_bytes, size = await asyncio.to_thread(_load)
+            from pipecat.frames.frames import InputImageRawFrame
+
+            await task.queue_frame(InputImageRawFrame(image=image_bytes, size=size, format="RGB"))
+            src = "imported photo" if b64 else url[:70]
+            logger.info(f"👁  Showed Nova the on-screen image ({size[0]}x{size[1]}): {src}")
+        except Exception as e:
+            logger.warning(f"viewing_image failed: {e}")
+
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender=None):
         try:
@@ -640,6 +716,13 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             # TTS and clears the output buffer, so she stops mid-sentence.
             logger.info("Tap-to-interrupt: flushing Nova's turn")
             await task.queue_frame(InterruptionFrame())
+        elif op == "viewing_image":
+            # User opened/switched to an image on screen → let Nova see it (Gemini/duplex only).
+            # Either a searched image's URL, or an imported photo's base64 JPEG bytes.
+            url = data.get("url", "")
+            b64 = data.get("bytes", "")
+            if (url or b64) and mode in _GEMINI_MODES:
+                asyncio.create_task(_show_image_to_nova(url=url, b64=b64))
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -707,6 +790,17 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
                 _RESUME["messages"] = msgs
                 _RESUME["at"] = time.monotonic()
                 logger.info(f"Snapshotted conversation for resume ({len(msgs)} messages, {RESUME_GRACE_SECS:.0f}s window).")
+                # Cross-session continuity: persist a short recap (the tail of the turns) so a
+                # LATER, fresh session — past the reconnect grace window — still picks up the
+                # thread ("where'd we land on that?"). Re-injected next time via memory.context_block.
+                tail = []
+                for m in msgs[-10:]:
+                    role, content = m.get("role"), m.get("content")
+                    if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                        who = "User" if role == "user" else "Nova"
+                        tail.append(f"{who}: {content.strip()}")
+                if tail:
+                    memory.set_summary(user_id, "\n".join(tail))
         except Exception as e:
             logger.warning(f"Resume snapshot skipped: {e}")
         await task.cancel()

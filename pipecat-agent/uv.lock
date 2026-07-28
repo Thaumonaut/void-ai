@@ -887,6 +887,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "loguru" },
+    { name = "pillow" },
     { name = "pipecat-ai", extra = ["google", "runner", "webrtc"] },
     { name = "python-dotenv" },
 ]
@@ -894,6 +895,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "loguru", specifier = ">=0.7" },
+    { name = "pillow", specifier = ">=12.3.0" },
     { name = "pipecat-ai", extras = ["soniox", "openrouter", "silero", "webrtc", "runner", "google"], specifier = ">=1.6.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
 ]

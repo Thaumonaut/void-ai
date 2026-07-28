@@ -74,6 +74,12 @@ class UiBridge:
     ) -> None:
         await self._send("products", items=items, query=query, collapse=collapse)
 
+    async def videos(
+        self, items: list, query: Optional[str] = None, collapse: bool = True,
+    ) -> None:
+        # items: [{title, channel, dur, url, id, thumb}] — a grid whose items play in a WKWebView.
+        await self._send("videos", items=items, query=query, collapse=collapse)
+
     async def web(
         self, url: str, title: Optional[str] = None, blocks: Optional[list] = None,
         tabs: Optional[list] = None, active: Optional[int] = None, collapse: bool = False,
