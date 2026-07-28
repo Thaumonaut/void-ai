@@ -1,8 +1,8 @@
 ## 1. Auth + rate limit
 
-- [ ] 1.1 Require a shared secret / signed offer on `/api/offer`; reject unauthenticated callers before any tool/LLM spend
+- [x] 1.1 Require a shared secret / signed offer on `/api/offer`; reject unauthenticated callers before any tool/LLM spend — shipped: `BOT_AUTH_TOKEN` Starlette middleware, checks `x-bot-token` header (or `?token=`), returns 403 before the offer is handled. App bakes the token in at build (`option_env!` from `.env.local`). Verified 403 no-token / 200 with-token
 - [ ] 1.2 Per-IP (or per-token) rate limiting
-- [ ] 1.3 Apply the same auth + a short TTL to `/ice`
+- [x] 1.3 Apply the same auth to `/ice` — shipped: `/ice` is in the same middleware's guarded-path set. (Short per-offer TTL still deferred.)
 
 ## 2. TLS + transport security
 
@@ -15,7 +15,7 @@
 - [ ] 3.1 Move provider keys out of request URLs into headers where supported (Mapbox/SerpApi)
 - [ ] 3.2 Sanitize errors before `logger.exception` / tool-result strings — provider + status only, never the key/URL
 - [ ] 3.3 Drop/coarsen the GPS log line
-- [ ] 3.4 Confirm the Mapbox `pk.` token is bundle/URL-restricted + minimally scoped; rotate; consider proxying Directions via the bot
+- [ ] 3.4 Confirm the Mapbox `pk.` token is bundle/URL-restricted + minimally scoped; rotate; consider proxying Directions via the bot — *partial:* the token is now build-injected from gitignored `.env.local` (out of committed source) and was purged from git history before the repo went public. Still to do in the Mapbox dashboard: URL-restrict + rotate the exposed token.
 
 ## 4. Resilience posture (related)
 
