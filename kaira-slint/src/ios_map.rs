@@ -25,6 +25,14 @@ thread_local! {
 
 // Mapbox GL JS. Public (pk.*) token — GL JS rejects secret sk.* tokens. `window.updateMap`
 // takes { markers:[{lng,lat,label}], center:[lng,lat], zoom } and fits/flies to it.
+// Public (pk.) Mapbox token for rendering the map — publishable, but injected at BUILD time from
+// the gitignored .env.local (MAPBOX_PUBLIC_TOKEN) so it stays out of committed/open-source code.
+// Substituted into MAPBOX_HTML's `__MAPBOX_PK__` placeholder when the web view loads.
+const MAPBOX_PK: &str = match option_env!("MAPBOX_PUBLIC_TOKEN") {
+    Some(t) => t,
+    None => "",
+};
+
 const MAPBOX_HTML: &str = r#"<!doctype html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <link href="https://unpkg.com/mapbox-gl@3/dist/mapbox-gl.css" rel="stylesheet">
@@ -142,7 +150,7 @@ pub fn show_at(window: &slint::Window, x: f32, y: f32, w: f32, h: f32) {
             let webview: Retained<AnyObject> =
                 msg_send![alloc, initWithFrame: frame, configuration: &*config];
             let _: () = msg_send![&*webview, setOpaque: false];
-            let html = NSString::from_str(MAPBOX_HTML);
+            let html = NSString::from_str(&MAPBOX_HTML.replace("__MAPBOX_PK__", MAPBOX_PK));
             let base = NSString::from_str("https://kaira.local/");
             if let Some(url) = NSURL::URLWithString(&base) {
                 let _: *mut AnyObject = msg_send![&*webview, loadHTMLString: &*html, baseURL: &*url];

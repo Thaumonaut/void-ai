@@ -21,11 +21,14 @@ export CARGO_PROFILE_RELEASE_DEBUG="${CARGO_PROFILE_RELEASE_DEBUG:-1}"
 # (webrtc + skia = ~15 GB) from scratch every clean build — slow, and it filled the disk.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SRCROOT/target}"
 
-# Bake the backend auth token from the gitignored ../.env.local into the build (realtime.rs reads
-# it via option_env!), so the app can reach a protected backend. Absent (fresh clone) → empty →
-# point that build at your own backend.
-if [ -z "${BOT_AUTH_TOKEN:-}" ] && [ -f "$SRCROOT/../.env.local" ]; then
-    export BOT_AUTH_TOKEN="$(grep -E '^BOT_AUTH_TOKEN=' "$SRCROOT/../.env.local" | head -1 | cut -d= -f2-)"
+# Bake build-time tokens from the gitignored ../.env.local into the build (realtime.rs + ios_map.rs
+# read them via option_env!): the backend auth token + the publishable Mapbox token. Absent (fresh
+# clone) → empty → point that build at your own backend / set your own tokens.
+if [ -f "$SRCROOT/../.env.local" ]; then
+    for _v in BOT_AUTH_TOKEN MAPBOX_PUBLIC_TOKEN; do
+        _val="$(grep -E "^$_v=" "$SRCROOT/../.env.local" | head -1 | cut -d= -f2-)"
+        [ -n "$_val" ] && export "$_v=$_val"
+    done
 fi
 
 IS_SIMULATOR=0
