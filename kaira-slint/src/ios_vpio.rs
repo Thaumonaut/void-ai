@@ -35,7 +35,45 @@ pub struct Vpio {
 unsafe impl Send for Vpio {}
 
 impl Vpio {
+    /// Explicit teardown. The real work is in `Drop`, so an ABORTED session task — whose
+    /// future is dropped mid-flight when a hung `write_sample` trips the controller's 6s
+    /// watchdog — still tears the unit down. Without that, the leaked unit keeps capturing
+    /// and the hardware mic (orange indicator) stays live until the app is force-quit.
     pub fn stop(self) {
+        // `self` falls out of scope here → `Drop` runs the teardown.
+    }
+
+    /// Hard-mute: enable/disable the mic INPUT element without tearing the unit down, so the
+    /// hardware mic (and the orange indicator) actually turns off while playback keeps running
+    /// (Nova stays audible). `EnableIO` is a pre-initialize property, so the unit has to be
+    /// stopped + uninitialized to change it, then re-initialized + restarted. There's a brief
+    /// (~tens of ms) output gap across the toggle, which is fine for a mute button.
+    pub fn set_input_enabled(&self, on: bool) {
+        unsafe {
+            AudioOutputUnitStop(self.unit);
+            AudioUnitUninitialize(self.unit);
+            let v: u32 = on as u32;
+            let r = AudioUnitSetProperty(
+                self.unit,
+                kAudioOutputUnitProperty_EnableIO,
+                kAudioUnitScope_Input,
+                INPUT_BUS,
+                &v as *const _ as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let i = AudioUnitInitialize(self.unit);
+            let s = AudioOutputUnitStart(self.unit);
+            eprintln!("[vpio] set_input_enabled({on}) → setprop={r} init={i} start={s} (0=ok)");
+        }
+    }
+}
+
+impl Drop for Vpio {
+    fn drop(&mut self) {
+        // Tear down THIS attempt's unit (releases the hardware mic). The audio SESSION is
+        // NOT deactivated here — it's per-connection, not per-attempt: on a reconnect the
+        // next attempt reuses the live session, so deactivating here would race the new
+        // attempt's mic and kill capture. The controller deactivates once, on user hang-up.
         unsafe {
             AudioOutputUnitStop(self.unit);
             AudioUnitUninitialize(self.unit);

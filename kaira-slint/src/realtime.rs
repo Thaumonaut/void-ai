@@ -191,8 +191,12 @@ fn rt_thread(
     let teardown = |s: Arc<AtomicBool>, h: tokio::task::JoinHandle<()>| {
         s.store(true, Ordering::SeqCst);
         let ah = h.abort_handle();
+        // Construct the timeout INSIDE the async block so its timer `Sleep` is created within
+        // block_on's runtime context. Building `tokio::time::timeout(..)` as a bare argument
+        // runs `Instant::now()` before block_on enters the runtime → "no reactor running" panic,
+        // which killed this controller thread on the first hang-up (so reconnect did nothing).
         if runtime
-            .block_on(tokio::time::timeout(Duration::from_secs(6), h))
+            .block_on(async { tokio::time::timeout(Duration::from_secs(6), h).await })
             .is_err()
         {
             ah.abort();
@@ -220,6 +224,11 @@ fn rt_thread(
                 if let Some((s, h)) = current.take() {
                     teardown(s, h);
                 }
+                // User ended the call — now (and only now) release the audio session, so iOS
+                // drops the mic reservation. Per-attempt teardown only disposes the mic unit;
+                // deactivating here (not per-attempt) keeps the session alive across reconnects.
+                #[cfg(target_os = "ios")]
+                crate::ios_audio::deactivate();
                 status("realtime: disconnected".into());
                 state(ConnState::Ended);
             }
@@ -732,7 +741,48 @@ async fn run_attempt(
     let mut last_beat = Instant::now();
     // Last instant Nova was audibly active; the mic gate holds closed for a hangover past it.
     let mut last_bot_active = Instant::now();
+    let mut last_muted = false;
     while !stop.load(Ordering::SeqCst) {
+        // Hard-mute: on the mute toggle, disable (re-enable) the VPIO mic CAPTURE so the
+        // hardware mic — and the orange indicator — actually turns off, while playback keeps
+        // running so Nova stays audible. Soft-mute (silence below) alone left the mic hot.
+        let muted = MUTED.load(Ordering::SeqCst);
+        if muted != last_muted {
+            last_muted = muted;
+            #[cfg(target_os = "ios")]
+            if let Some(v) = &vpio {
+                v.set_input_enabled(!muted);
+            }
+        }
+        if muted {
+            // Drop any captured audio (on non-iOS the cpal thread keeps filling this) so it
+            // can't accumulate while muted, and keep the bot's inbound track alive with paced
+            // 20 ms silence (else it times out and the session drops while you're muted).
+            mic_buf.lock().unwrap().clear();
+            if let Some(op) = enc.encode(&vec![0f32; FRAME]) {
+                let sample = Sample {
+                    data: op.into(),
+                    duration: Duration::from_millis(20),
+                    ..Default::default()
+                };
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    out_track.write_sample(&sample),
+                )
+                .await;
+            }
+            gated += 1;
+            if last_beat.elapsed() >= Duration::from_secs(1) {
+                eprintln!("[tx] MUTED — gated={gated} (per ~1s)");
+                sent = 0;
+                gated = 0;
+                enc_fail = 0;
+                write_fail = 0;
+                last_beat = Instant::now();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
         let frame: Option<Vec<f32>> = {
             let mut b = mic_buf.lock().unwrap();
             if b.len() >= FRAME {
@@ -783,10 +833,22 @@ async fn run_attempt(
                         duration: Duration::from_millis(20),
                         ..Default::default()
                     };
-                    match out_track.write_sample(&sample).await {
-                        Ok(_) if !bot_speaking => sent += 1,
-                        Ok(_) => {}
-                        Err(_) => write_fail += 1,
+                    // Time-box the send: on a closing/degraded connection write_sample can
+                    // block indefinitely, which would stop this loop from re-checking `stop` —
+                    // so a hang-up never reaches teardown and the controller ABORTS the task
+                    // (leaving audio/PC cleanup to run at an unpredictable time, which races the
+                    // next Connect). A short cap keeps the loop responsive so teardown is
+                    // deterministic. A healthy 20 ms frame writes in well under this.
+                    match tokio::time::timeout(
+                        Duration::from_millis(300),
+                        out_track.write_sample(&sample),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) if !bot_speaking => sent += 1,
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => write_fail += 1,
+                        Err(_) => write_fail += 1, // send stalled — loop back and re-check stop
                     }
                 } else if !bot_speaking {
                     enc_fail += 1;
@@ -803,13 +865,16 @@ async fn run_attempt(
             last_beat = Instant::now();
         }
     }
-    // Full teardown so the next Connect starts clean: close the PC (server discards its
-    // side promptly) and release the audio devices.
-    let _ = pc.close().await;
+    // Release THIS attempt's mic unit BEFORE pc.close() (the audit flagged it as occasionally
+    // hanging). `Vpio::stop` runs via Drop, which ALSO fires if this task is aborted mid-flight,
+    // so the hardware mic is freed even when the close overruns the controller's 6s watchdog.
+    // The audio SESSION is left active — a reconnect attempt reuses it; the controller
+    // deactivates it once, on the user's Disconnect (see rt_thread).
     #[cfg(target_os = "ios")]
     if let Some(v) = vpio {
         v.stop();
     }
+    let _ = pc.close().await;
     #[cfg(not(target_os = "ios"))]
     {
         let _ = play_handle.join();

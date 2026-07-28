@@ -41,3 +41,20 @@ pub fn activate() {
         }
     }
 }
+
+/// Release the shared audio session when a call ends. Without this the `playAndRecord`
+/// session stays active after the VPIO unit stops, so iOS keeps the mic reserved and the
+/// orange in-use indicator lit — even when the app is idle or backgrounded. Call on
+/// realtime teardown; the next `activate()` brings it back. `NotifyOthersOnDeactivation`
+/// lets any other app's audio resume. Best-effort — logs but never panics.
+pub fn deactivate() {
+    unsafe {
+        let session = AVAudioSession::sharedInstance();
+        if let Err(e) = session.setActive_withOptions_error(
+            false,
+            objc2_avf_audio::AVAudioSessionSetActiveOptions::NotifyOthersOnDeactivation,
+        ) {
+            eprintln!("[ios-audio] setActive(false) failed: {e:?}");
+        }
+    }
+}

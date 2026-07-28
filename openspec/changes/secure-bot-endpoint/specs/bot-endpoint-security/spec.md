@@ -29,6 +29,17 @@ The bot SHALL NOT write API keys or user location to logs.
 - **WHEN** the client sends its GPS location
 - **THEN** the raw coordinates are not logged at info level
 
+### Requirement: Bounded session lifecycle
+A voice session SHALL be torn down when its inbound media stops or it exceeds a maximum duration, so a dropped, backgrounded, or runaway client cannot hold a pipeline — and its paid STT/LLM/TTS quota — open indefinitely. Reaping a session SHALL NOT bring down the server.
+
+#### Scenario: Client drops or is backgrounded
+- **WHEN** inbound audio stops arriving for the idle timeout and no clean disconnect fired
+- **THEN** the session is cancelled (freeing its STT/LLM/TTS spend) and the server stays up for the next connection
+
+#### Scenario: Runaway session
+- **WHEN** a session stays active past the maximum session duration
+- **THEN** it is cancelled regardless of ongoing media
+
 ### Requirement: Repointable endpoint
 The client SHALL reach the bot by a resolvable domain so the backend can be moved without shipping a new app build.
 

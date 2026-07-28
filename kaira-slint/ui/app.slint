@@ -29,12 +29,13 @@ export global VS {
     out property <color> line:      dark ? #333745 : #e4e6ee;
     out property <color> cardline:  dark ? #2e3240 : #f0f1f6;
     out property <color> url-bg:    dark ? #191b22 : #f3f4f8;
-    out property <color> orange:    #ef4d2a;
-    out property <color> orange2:   #ff6f42;
+    // Brand accent follows the active persona: Nova = coral, Kaira = medical green.
+    out property <color> orange:    Persona.index == 1 ? #2fa36a : #ef4d2a;
+    out property <color> orange2:   Persona.index == 1 ? #3fbe7f : #ff6f42;
     out property <color> speaker-user: dark ? #5fc7b6 : #128577;   // teal — the user's voice, distinct from Nova's orange
     // orange "slabs" (app bar / strip / CTA) — dimmed + desaturated in dark so they don't sear on black
-    out property <color> slab-hi:   dark ? #c85230 : #ff6f42;
-    out property <color> slab-lo:   dark ? #b03c22 : #ef4d2a;
+    out property <color> slab-hi:   dark ? (Persona.index == 1 ? #2b8c5c : #c85230) : (Persona.index == 1 ? #3fbe7f : #ff6f42);
+    out property <color> slab-lo:   dark ? (Persona.index == 1 ? #237049 : #b03c22) : (Persona.index == 1 ? #2fa36a : #ef4d2a);
     out property <color> switchoff: dark ? #6b7185 : #97a3b6;
 
     // --- spacing scale (4px grid) — everything aligns to these, no ad-hoc values ---
@@ -120,6 +121,17 @@ global Pal {
     // aliases so existing Lab references keep working under the new palette
     out property <color> coral: #8a7bff;
     out property <color> amber: #d982f0;
+}
+
+// Which agent is active. Swipe the agent icon to flip it (Phase 1: name + accent change,
+// orb for both; Kaira's avatar comes in Phase 2). Rust reads `index` to pick the bot URL.
+export global Persona {
+    in-out property <int> index: 0;                                  // 0 = Nova · 1 = Kaira
+    out property <int> count: 2;
+    out property <string> id: index == 1 ? "kaira" : "nova";
+    out property <string> name: index == 1 ? "Kaira" : "Nova";
+    out property <string> name-upper: index == 1 ? "KAIRA" : "NOVA";
+    out property <color> accent: index == 1 ? #35b27a : Pal.violet;  // Kaira green · Nova violet
 }
 
 // Clean line icons (24×24 viewbox) so we're not shipping emoji.
@@ -630,7 +642,7 @@ component ActiveView inherits Rectangle {
                                         spacing: 22px;    // gap between turns (label stays grouped with its own message below)
                                         alignment: start;
                                         if VS.chat-turns.length == 0: Text {
-                                            text: "…tap Nova and start talking — she opens with a fresh line every time.";
+                                            text: "…tap \{Persona.name} and start talking — she opens with a fresh line every time.";
                                             color: VS.ink3;
                                             font-family: "Figtree";
                                             font-size: 14px;
@@ -641,7 +653,7 @@ component ActiveView inherits Rectangle {
                                             spacing: 6px;
                                             alignment: start;
                                             Text {
-                                                text: t.is-user ? "YOU" : "NOVA";
+                                                text: t.is-user ? "YOU" : Persona.name-upper;
                                                 color: t.is-user ? VS.speaker-user : VS.orange;
                                                 font-family: "Figtree";
                                                 font-size: 11px;
@@ -1182,8 +1194,27 @@ export component MainWindow inherits Window {
     in property <[float]> wave;              // rolling signed history: + = Nova, − = you, 0 = idle
     callback wave-tick();                    // Rust advances the wave history each tick
     property <bool> mic-active: root.rt-mic-level > 0.02;
-    property <bool> agent-active: root.rt-agent-level > 0.03;
+    // Inbound level oscillates in the gaps between words, so treat it as an ENVELOPE and HOLD
+    // `agent-active` ~500ms after it drops — otherwise the "TAP TO STOP" label + the talking
+    // animation flicker on every syllable, making the pause tap hard to hit. The held
+    // `agent-active` is what the label, pause target, and Kaira avatar all read.
+    property <bool> agent-talking-raw: root.rt-agent-level > 0.03;
+    property <bool> agent-active: false;
+    changed agent-talking-raw => {
+        if (root.agent-talking-raw) { root.agent-active = true; agent-hold-timer.running = false; }
+        else { agent-hold-timer.running = true; }
+    }
     property <bool> user-active: root.rt-mic-level > 0.03 && !root.agent-active;
+    // Kaira talking-animation frame cursor (advanced by kaira-talk-timer while she speaks).
+    property <int> kaira-frame: 0;
+    property <[image]> kaira-talk: [
+        @image-url("../assets/kaira/talk/01.png"), @image-url("../assets/kaira/talk/02.png"),
+        @image-url("../assets/kaira/talk/03.png"), @image-url("../assets/kaira/talk/04.png"),
+        @image-url("../assets/kaira/talk/05.png"), @image-url("../assets/kaira/talk/06.png"),
+        @image-url("../assets/kaira/talk/07.png"), @image-url("../assets/kaira/talk/08.png"),
+        @image-url("../assets/kaira/talk/09.png"), @image-url("../assets/kaira/talk/10.png"),
+        @image-url("../assets/kaira/talk/11.png"),
+    ];
 
     // Engine info shown under each picker: deployment · size · languages.
     pure function stt-meta(i: int) -> string {
@@ -1212,6 +1243,7 @@ export component MainWindow inherits Window {
     callback rt-speak(string, int, int, int); // text, TTS engine, Opus cap kbps (0=on-device), bitrate
     callback opus-stream(int, int); // downlink cap kbps (0=unlimited), opus bitrate kbps
     callback realtime-toggle(); // connect/disconnect the realtime WebRTC agent
+    callback persona-switched(); // user swiped the agent icon → reconnect to the new persona's bot
     callback mic-mute(bool);    // mute/unmute the outbound mic on the realtime client
     callback open-url(string);  // open a URL in the phone (product store page, map location, …)
     callback interrupt-nova();  // tap the waveform to cut Nova off mid-sentence
@@ -1222,6 +1254,19 @@ export component MainWindow inherits Window {
     background: root.tab == 0 ? VS.canvas : Pal.bg;
     default-font-family: "Space Mono";
     title: "VOID_AI";
+
+    // Holds `agent-active` true for 500ms after the inbound level drops (debounce — see above).
+    agent-hold-timer := Timer {
+        interval: 500ms;
+        running: false;
+        triggered => { root.agent-active = false; self.running = false; }
+    }
+    // Advances Kaira's talking frames (~11fps) while she is actually speaking.
+    kaira-talk-timer := Timer {
+        interval: 90ms;
+        running: Persona.index == 1 && root.agent-active;
+        triggered => { root.kaira-frame = root.kaira-frame >= 10 ? 0 : root.kaira-frame + 1; }
+    }
 
     VerticalLayout {
         spacing: 0;
@@ -1267,26 +1312,89 @@ export component MainWindow inherits Window {
                     }
 
                     // ===== Nova presence (the constellation; hidden when collapsed or full-screen) =====
-                    if !VS.collapsed && !VS.fullscreen: Rectangle {
+                    if !VS.collapsed && !VS.fullscreen: agentPresence := Rectangle {
                         height: 132px;
                         property <bool> breathe: false;
+                        // One-shot swap animation: ANY change to the active persona (swipe OR the
+                        // settings toggle) pulses the glow + flashes the name pill, so the swap is
+                        // unmistakable. persona-watch mirrors Persona.index so `changed` fires on both.
+                        property <int> persona-watch: Persona.index;
+                        property <bool> swapping: false;
+                        changed persona-watch => { self.swapping = true; swapTimer.running = true; }
+                        swapTimer := Timer {
+                            interval: 640ms;
+                            running: false;
+                            triggered => { agentPresence.swapping = false; self.running = false; }
+                        }
                         Timer {
                             interval: 2200ms;
                             running: true;
-                            triggered => { parent.breathe = !parent.breathe; }
+                            triggered => { agentPresence.breathe = !agentPresence.breathe; }
+                        }
+                        // persona-tinted glow behind the orb (violet=Nova, green=Kaira); expands +
+                        // brightens for the swap pulse, then settles.
+                        Rectangle {
+                            width: agentPresence.swapping ? 176px : 150px;
+                            height: self.width;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: self.width / 2;
+                            background: Persona.accent;
+                            opacity: agentPresence.swapping ? 0.5 : (root.rt-connected ? 0.20 : 0.12);
+                            animate width, background, opacity { duration: 320ms; easing: ease-out; }
                         }
                         Image {
                             width: (parent.breathe ? 134px : 122px) + (root.mic-active ? 6px : 0px);
                             height: self.width;
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                            source: @image-url("../assets/agent_icon_orange.svg");
+                            source: Persona.index == 1
+                                ? (root.agent-active ? root.kaira-talk[root.kaira-frame] : @image-url("../assets/kaira/idle.png"))
+                                : @image-url("../assets/agent_icon_orange.svg");
                             image-fit: contain;
                             opacity: root.rt-connected ? 1.0 : 0.88;
                             animate width { duration: 2000ms; easing: ease-in-out; }
                             animate opacity { duration: 300ms; }
                         }
-                        TouchArea { clicked => { root.realtime-toggle(); } }
+                        // swap confirmation pill — flashes the new persona's name on switch
+                        Rectangle {
+                            x: (parent.width - self.width) / 2;
+                            y: parent.height - self.height;
+                            width: swapName.preferred-width + 22px;
+                            height: 26px;
+                            border-radius: 13px;
+                            background: Persona.accent;
+                            opacity: agentPresence.swapping ? 1.0 : 0.0;
+                            animate opacity { duration: 200ms; }
+                            swapName := Text {
+                                text: Persona.name;
+                                color: white;
+                                font-size: 13px;
+                                font-weight: 800;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                        }
+                        // Tap = connect/disconnect. Horizontal swipe (>44px) = switch agent.
+                        TouchArea {
+                            property <length> down-x;
+                            // Decide tap vs swipe on release: a >44px horizontal drag switches the
+                            // agent; anything shorter is a tap to connect/disconnect. (No `clicked`
+                            // handler — it races the swipe detection and both would fire.)
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down) { self.down-x = self.mouse-x; }
+                                if (e.kind == PointerEventKind.up) {
+                                    if (self.mouse-x - self.down-x > 44px || self.down-x - self.mouse-x > 44px) {
+                                        Persona.index = Persona.index == 0 ? 1 : 0;
+                                        root.persona-switched();
+                                    } else {
+                                        root.realtime-toggle();
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // strip: TALKING label + [share] waveform [collapse] — hidden in full-screen
@@ -1315,9 +1423,9 @@ export component MainWindow inherits Window {
                                     // Truthful: show the live status while connecting/reconnecting,
                                     // a retry prompt on failure, and only say "TALKING" once really live.
                                     text: root.rt-failed ? root.rt-status
-                                        : !root.rt-connected ? "TAP NOVA TO CONNECT"
+                                        : !root.rt-connected ? "TAP \{Persona.name-upper} TO CONNECT · SWIPE TO SWITCH"
                                         : !root.rt-live ? root.rt-status
-                                        : root.agent-active ? "NOVA — TAP TO STOP"
+                                        : root.agent-active ? "\{Persona.name-upper} — TAP TO STOP"
                                         : root.user-active ? "YOU"
                                         : "TALKING";
                                     color: #ffffffee;
@@ -1816,6 +1924,25 @@ export component MainWindow inherits Window {
                                         background: VS.dark ? VS.orange : VS.url-bg;
                                         Text { text: "Dark"; color: VS.dark ? white : VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
                                         TouchArea { clicked => { VS.dark = true; root.save-setting("theme", "dark"); } }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Agent"; color: VS.ink2; font-size: 12px; font-weight: 700; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        height: 44px; border-radius: 11px;
+                                        background: Persona.index == 0 ? VS.orange : VS.url-bg;
+                                        Text { text: "Nova"; color: Persona.index == 0 ? white : VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        TouchArea { clicked => { if (Persona.index != 0) { Persona.index = 0; root.persona-switched(); } } }
+                                    }
+                                    Rectangle {
+                                        height: 44px; border-radius: 11px;
+                                        background: Persona.index == 1 ? VS.orange : VS.url-bg;
+                                        Text { text: "Kaira"; color: Persona.index == 1 ? white : VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        TouchArea { clicked => { if (Persona.index != 1) { Persona.index = 1; root.persona-switched(); } } }
                                     }
                                 }
                             }

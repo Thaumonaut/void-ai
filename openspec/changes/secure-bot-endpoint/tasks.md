@@ -20,3 +20,6 @@
 ## 4. Resilience posture (related)
 
 - [ ] 4.1 Document/plan a move off single-droplet single-session (per-session workers / warm failover) — out of scope to fully build here, but capture the plan
+- [x] 4.2 Idle-session reaper — cancel a session whose inbound media (`InputAudioRawFrame`) stopped for `KAIRA_IDLE_TIMEOUT_SECS` (default 60s), so a dropped/backgrounded client stops burning STT/LLM/TTS quota. Uses pipecat's idle detection but on media (not Bot/UserSpeaking) frames, and cancels only the session (`cancel_runner_on_idle_timeout=False`) so the server stays up. Server-side counterpart to the client reconnect supervisor (`harden-realtime-connection`). Verified with a headless idle-reap test (no false reap while media flows; reaps on stop)
+- [x] 4.3 Max-session hard cap (`KAIRA_MAX_SESSION_SECS`, default 30 min) — backstop that ends even an always-active session
+- [ ] 4.4 Verify reaping live on the droplet (drop network mid-call → session reaped in logs; reconnect → fresh session)

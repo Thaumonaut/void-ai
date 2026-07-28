@@ -16,6 +16,7 @@ Env (see .env.example): SONIOX_API_KEY, OPENROUTER_API_KEY.
 
 import os
 import sys
+import time
 from collections.abc import AsyncGenerator
 
 # Local module. bot.py runs from its own dir, but be robust when the runner imports it.
@@ -29,7 +30,14 @@ from websockets.protocol import State
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import ErrorFrame, Frame, InterruptionFrame, LLMRunFrame, TTSStoppedFrame
+from pipecat.frames.frames import (
+    BotSpeakingFrame,
+    ErrorFrame,
+    Frame,
+    InterruptionFrame,
+    LLMRunFrame,
+    TTSStoppedFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -330,6 +338,19 @@ SYSTEM_PROMPT = (
     "emoji; you're read aloud, so keep it snappy."
 )
 
+# Persona selector: KAIRA_PERSONA=kaira swaps Nova (sassy assistant) for Kaira (a calm,
+# friendly GP health assistant that runs a standard clinical consultation) — its own prompt +
+# voice, and NO view tools (pure conversation). Nova's prompt stays above; personas.py carries
+# Kaira's prompt and each persona's voice/tools. GEMINI_VOICE still overrides the voice.
+from personas import get_persona as _get_persona  # noqa: E402
+
+_PERSONA = _get_persona(os.getenv("KAIRA_PERSONA", "nova"))
+if _PERSONA["prompt"]:
+    SYSTEM_PROMPT = _PERSONA["prompt"]
+PERSONA_VOICE = _PERSONA["voice"]
+PERSONA_TOOLS = _PERSONA["tools"]  # a ToolsSchema per persona (NOVA_TOOLS / KAIRA_TOOLS)
+logger.info(f"Persona: {_PERSONA['label']} (voice={PERSONA_VOICE}, tools={'on' if PERSONA_TOOLS else 'off'})")
+
 # ---- VAD tuning (this is what the realtime/VAD test is for) ----
 # start_secs: speech must persist this long before "user started talking" fires
 #             (raise it to ignore short noises; lower it to feel snappier).
@@ -355,13 +376,31 @@ _VAD = SileroVADAnalyzer(params=VAD_PARAMS)
 _SMART_TURN = LocalSmartTurnAnalyzerV3()
 
 
+# Connection-resilience limits (env-tunable). The client has a reconnect supervisor
+# (harden-realtime-connection); this is its server-side counterpart so a session that
+# silently dies — or never ends — can't hold a pipeline (and its STT/LLM/TTS quota) open.
+IDLE_TIMEOUT_SECS = float(os.getenv("KAIRA_IDLE_TIMEOUT_SECS", "60"))  # no media for this long → reap
+MAX_SESSION_SECS = float(os.getenv("KAIRA_MAX_SESSION_SECS", "1800"))  # 30-min hard ceiling per session
+
+# Cross-reconnect continuity: on disconnect we snapshot the live conversation; a reconnect
+# within RESUME_GRACE_SECS restores it (history back + greeting skipped) instead of a cold
+# "fresh call". The connection is single/sequential, so one module-level slot is enough.
+RESUME_GRACE_SECS = float(os.getenv("KAIRA_RESUME_GRACE_SECS", "120"))
+_RESUME = {"messages": None, "at": 0.0}
+
+
 async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     """Build + run the Kaira pipeline on `transport` (WebRTC via the runner, or the
     raw-WebSocket transport used by the Slint on-device client — see ws_bot.py)."""
     logger.info("Starting Kaira realtime bot")
 
     # The context (system prompt + Nova's tool schemas) is shared by both modes.
-    context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}], tools=NOVA_TOOLS)
+    # LLMContext rejects tools=None (wants the arg OMITTED for "no tools"); the Gemini service,
+    # by contrast, accepts None. Kaira runs tool-free (PERSONA_TOOLS=None) → omit tools here.
+    context = LLMContext(
+        [{"role": "system", "content": SYSTEM_PROMPT}],
+        **({"tools": PERSONA_TOOLS} if PERSONA_TOOLS else {}),
+    )
 
     # KAIRA_MODE picks the voice pipeline: "cascade" (default, Soniox+Gemma+Soniox) or
     # "ultravox" (full-duplex S2S — one audio-native model replaces STT+LLM+TTS). Same
@@ -394,6 +433,71 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         )
         # No TTS service in this pipeline; Ultravox covers the tool-fetch gap itself
         # (async placeholder), so skip the TTSSpeakFrame filler.
+        speak_filler = False
+    elif mode in ("gemini", "gemini-live", "gemini_live", "live"):
+        # Gemini Live full-duplex S2S — one audio-native model replaces STT+LLM+TTS,
+        # same tools + UiBridge as the other modes (clean A/B on the same device).
+        # Model is env-overridable (GEMINI_LIVE_MODEL); NOTE the required `models/` prefix.
+        # As of 2026-07 the newest Live / native-audio model is gemini-3.1-flash-live-preview
+        # (3.5/3.6 Flash are the STANDARD text models — there is no 3.5/3.6 *live* variant).
+        # GEMINI_VOICE picks a prebuilt voice. Male: Puck (upbeat), Charon (deep), Fenrir
+        # (energetic), Orus (firm). Female: Aoede, Kore, Leda, Zephyr. For the Bahasa-Indonesia
+        # work eval, set GEMINI_LANG=id AND swap SYSTEM_PROMPT to Indonesian.
+        gemini_model = os.getenv("GEMINI_LIVE_MODEL", "models/gemini-3.1-flash-live-preview")
+        logger.info(f"KAIRA_MODE=gemini — Gemini Live full-duplex S2S ({gemini_model})")
+        from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
+
+        gkey = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not gkey:
+            logger.error("KAIRA_MODE=gemini needs GOOGLE_API_KEY (or GEMINI_API_KEY) in ../.env.local")
+        _id_lang = os.getenv("GEMINI_LANG", "").lower() in ("id", "id-id", "indonesian")
+        llm = GeminiLiveLLMService(
+            api_key=gkey,
+            tools=PERSONA_TOOLS,  # None for Kaira (pure consultation); NOVA_TOOLS for Nova
+            settings=GeminiLiveLLMService.Settings(
+                model=gemini_model,
+                voice=os.getenv("GEMINI_VOICE") or PERSONA_VOICE,
+                system_instruction=SYSTEM_PROMPT,
+                # Disable Gemini's SERVER-side VAD so our local Silero VAD (in the aggregator)
+                # is the SOLE turn authority — it sends Gemini explicit activity_start/end per
+                # turn. Running both VADs let turn 1 through but dropped turn 2: the browser
+                # client mutes the mic while Nova speaks, and those gaps break Gemini's
+                # continuous-stream server VAD. Local-VAD-driven turns are robust to the muting.
+                vad=GeminiVADParams(disabled=True),
+                # Only pin a language when asked (Indonesian eval); otherwise let it follow
+                # the prompt / auto-detect so the English default path stays clean.
+                **({"language": Language.ID} if _id_lang else {}),
+            ),
+        )
+        # Gemini has its own server-side VAD, but pipecat still needs a LOCAL VAD to emit
+        # UserStartedSpeaking/StoppedSpeaking (which drive turn + barge-in handling) — the
+        # transport itself carries none (see bot() TransportParams), and cascade got its VAD
+        # from the aggregator too. Without it she streams audio out but never reacts to your
+        # voice. No smart-turn stop strategy here: let Gemini decide end-of-turn.
+        # Tools go on the SERVICE at init (above). Give the aggregators a context WITHOUT tools:
+        # if tools are ALSO in the context, GeminiLiveLLMService reconnects on the first context
+        # to reconcile them — and that reconnect knocks `_ready_for_realtime_input` false, after
+        # which `_send_user_audio` SILENTLY DROPS every mic frame. That's the exact bug: Soniox
+        # (cascade, before the LLM) hears you fine, but Gemini never receives audio. Tool RESULTS
+        # still flow — the assistant aggregator writes them into this context as `tool` messages,
+        # which is all _process_completed_function_calls reads to send them back to Gemini.
+        gemini_context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            gemini_context,
+            user_params=LLMUserAggregatorParams(vad_analyzer=_VAD),
+        )
+        # No TTS service in the pipeline, so the TTSSpeakFrame filler can't render; Gemini
+        # covers its own tool-fetch gap.
+        pipeline = Pipeline(
+            [
+                transport.input(),     # mic in
+                _AudioProbe(),         # [diagnostic] logs inbound mic RMS — remove once voice works
+                user_aggregator,
+                llm,                   # Gemini Live: audio in -> (tools) -> audio out
+                transport.output(),    # speaker out
+                assistant_aggregator,
+            ]
+        )
         speak_filler = False
     else:
         logger.info("KAIRA_MODE=cascade — Soniox STT + Gemma-4/Cerebras + Soniox TTS")
@@ -461,7 +565,26 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        # Reap a session whose media has stopped. InputAudioRawFrame streams continuously
+        # (~50/s) from transport.input() in EVERY mode while the link is live — even during
+        # silence — so its absence for IDLE_TIMEOUT_SECS means the client dropped, was
+        # backgrounded, or the network died. BotSpeakingFrame keeps a long Nova monologue
+        # alive if the client mutes its mic while she talks. We cancel only the SESSION, not
+        # the runner, so the server stays up for the next Connect. (The pipecat default —
+        # 300s on Bot/UserSpeakingFrame + cancel-the-runner — would both miss a dead-but-quiet
+        # link and risk false-reaping S2S modes that don't emit those speaking frames.)
+        idle_timeout_secs=IDLE_TIMEOUT_SECS,
+        idle_timeout_frames=(InputAudioRawFrame, BotSpeakingFrame),
+        cancel_on_idle_timeout=True,
+        cancel_runner_on_idle_timeout=False,
     )
+
+    @task.event_handler("on_idle_timeout")
+    async def on_idle_timeout(task):
+        logger.warning(
+            f"No inbound audio for {IDLE_TIMEOUT_SECS:.0f}s — client dropped or backgrounded; "
+            "reaping the session so it stops consuming STT/LLM/TTS quota."
+        )
 
     # Nova's handle on the client's view surface (see ui.py + UI_CONTRACT.md).
     ui = UiBridge(task)
@@ -495,15 +618,38 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
+        # Reconnect within the grace window → restore the conversation and stay quiet, so the
+        # user picks up mid-thread instead of getting a cold re-greeting. (Decided here, not at
+        # context creation, so the prior session's disconnect-snapshot has already landed.)
+        if _RESUME["messages"] and (time.monotonic() - _RESUME["at"]) < RESUME_GRACE_SECS:
+            context.set_messages(_RESUME["messages"])
+            n = len(_RESUME["messages"])
+            _RESUME["messages"] = None
+            logger.info(f"Client reconnected — resumed conversation ({n} messages).")
+            # A full-duplex S2S agent (Gemini) must SPEAK first or the client hangs forever on
+            # "waiting for messages…". Resuming with no trigger left it mute on reconnect, so
+            # nudge a ONE-LINE welcome-back and re-engage — history is preserved, we just skip
+            # the cold re-greeting. (Fresh connects below already queue an LLMRunFrame.)
+            context.add_message({
+                "role": "developer",
+                "content": ("The user just reconnected mid-conversation. In ONE short line, "
+                            "warmly welcome them back and continue right where you left off, "
+                            "then wait for them."),
+            })
+            await task.queue_frames([LLMRunFrame()])
+            return
+
+        _RESUME["messages"] = None  # stale/expired snapshot → genuine fresh start
         logger.info("Client connected — SassBot opening line")
         context.add_message(
             {
                 "role": "developer",
                 "content": (
-                    "The user just dialed you up. Open the call with a short, ORIGINAL, "
-                    "punchy sassy greeting that playfully roasts them for showing up — make "
-                    "it fresh and unexpected EVERY time, never a canned or repeated line. One "
-                    "sentence, then wait for them to talk."
+                    "The user just showed up. Open with a VERY short, sassy one-liner — just a "
+                    "few words you can say in under a second, like 'Look who's back.', "
+                    "'Miss me already?', 'Oh, it's you.', or 'Back for more?'. Make it fresh and "
+                    "different EVERY time, never a canned or repeated line. About 2 to 5 words — "
+                    "do NOT write a full sentence — then wait for them to talk."
                 ),
             }
         )
@@ -528,10 +674,35 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
+        # Snapshot the conversation so a quick reconnect resumes it instead of starting cold.
+        # (Skip if nothing was said — only the system prompt — so a bounced connect stays fresh.)
+        try:
+            msgs = context.get_messages()
+            if len(msgs) > 1:
+                _RESUME["messages"] = msgs
+                _RESUME["at"] = time.monotonic()
+                logger.info(f"Snapshotted conversation for resume ({len(msgs)} messages, {RESUME_GRACE_SECS:.0f}s window).")
+        except Exception as e:
+            logger.warning(f"Resume snapshot skipped: {e}")
         await task.cancel()
 
+    # Hard ceiling: even a client that keeps media flowing (so idle detection never fires)
+    # can't hold a pipeline — and its quota — open past MAX_SESSION_SECS.
+    async def _session_cap():
+        try:
+            await asyncio.sleep(MAX_SESSION_SECS)
+            logger.warning(f"Session hit the {MAX_SESSION_SECS / 60:.0f}-min hard cap — ending it.")
+            await task.cancel(reason="max session duration")
+        except asyncio.CancelledError:
+            pass
+
+    cap_task = asyncio.create_task(_session_cap())
+
     runner = PipelineRunner(handle_sigint=handle_sigint)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        cap_task.cancel()
 
 
 async def bot(runner_args: RunnerArguments):

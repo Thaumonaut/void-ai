@@ -607,12 +607,12 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Desktop-only visual check: VOIDAI_DEMO=1 seeds sample content so the view surface
-    // is populated without a live bot. Harmless on device (env unset).
-    // Seed sample content for a visual check: desktop via VOIDAI_DEMO=1, or any Android
-    // debug build (env vars don't reach the app there). TODO: gate off before Phase 3.
+    // Sample-content seed for a visual check without a live bot: desktop via VOIDAI_DEMO=1, or
+    // an Android debug build (env vars don't reach the app there). iOS boots to a CLEAN SLATE —
+    // real usage, empty views — so it's deliberately excluded (re-add `target_os = "ios"` below
+    // to demo on the sim).
     if std::env::var("VOIDAI_DEMO").is_ok()
-        || cfg!(all(any(target_os = "android", target_os = "ios"), debug_assertions))
+        || cfg!(all(target_os = "android", debug_assertions))
     {
         set_chat_turns(&ui, "🗣  You\nShow me some cool brutalist buildings in Seattle.\n\n🤖  Nova\nUgh, fine. Seattle's got a few concrete beasts — the kind of raw, unpainted slabs that look like they were poured by someone with a serious grudge against joy. Freeway Park, the old Public Safety Building before they mercifully demolished it, a couple of parking garages that somehow got called architecture. Try not to nod off on me while I dig them up, this is thrilling work.\n\n🗣  You\nWhich one is the best?\n\n🤖  Nova\nFreeway Park, obviously. It's a whole park stacked on top of a highway, which is either genius or a cry for help.");
         apply_ui_control(&ui, r#"{"op":"images","query":"brutalist buildings · Seattle","items":[{"cap":"freeway_park.jpg","full":"https://picsum.photos/seed/voidbru1/500/500"},{"cap":"rainier_square.jpg","full":"https://picsum.photos/seed/voidbru2/500/500"},{"cap":"kingdome_1976.jpg","full":"https://picsum.photos/seed/voidbru3/500/500"},{"cap":"seattle_muni.jpg","full":"https://picsum.photos/seed/voidbru4/500/500"}]}"#);
@@ -990,6 +990,33 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
             status, conn_state, level, agent_level, transcript, ui_control,
         ))
     };
+    // Bot URL for the selected persona (Nova=0, Kaira=1). Two-bot model: each persona is its
+    // own instance (KAIRA_PERSONA=nova|kaira) on its own port. Overridable per persona via
+    // realtime_url.txt (Nova) / realtime_url_kaira.txt (Kaira) in the app's files dir.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn bot_url_for(index: i32) -> String {
+        #[cfg(target_os = "ios")]
+        let (nova, kaira) = (
+            "http://143.198.134.89:8080/api/offer",
+            "http://143.198.134.89:8081/api/offer",
+        );
+        #[cfg(not(target_os = "ios"))]
+        let (nova, kaira) = (
+            "http://10.0.2.2:7860/api/offer",
+            "http://10.0.2.2:7861/api/offer",
+        );
+        let (default, fname) = if index == 1 {
+            (kaira, "realtime_url_kaira.txt")
+        } else {
+            (nova, "realtime_url.txt")
+        };
+        std::fs::read_to_string(format!("{}/{}", tts::files_dir(), fname))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    }
+
     ui.on_realtime_toggle({
         let w = ui_weak.clone();
         #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -1013,18 +1040,7 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                         // public IP with open UDP, so aiortc advertises a directly-reachable
                         // host candidate — NO TURN, works on any network incl. cellular.
                         // Android emulator → host loopback for fast local dev.
-                        #[cfg(target_os = "ios")]
-                        const DEFAULT_BOT: &str = "http://143.198.134.89:8080/api/offer";
-                        #[cfg(not(target_os = "ios"))]
-                        const DEFAULT_BOT: &str = "http://10.0.2.2:7860/api/offer";
-                        let url = std::fs::read_to_string(format!(
-                            "{}/realtime_url.txt",
-                            tts::files_dir()
-                        ))
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| DEFAULT_BOT.to_string());
+                        let url = bot_url_for(ui.global::<Persona>().get_index());
                         ui.set_rt_failed(false);
                         ui.set_rt_status("connecting…".into());
                         realtime.connect(url);
@@ -1034,6 +1050,26 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 ui.set_rt_status("Realtime needs Android or iOS.".into());
+            }
+        }
+    });
+
+    // Swipe on the agent icon switched persona → reconnect to that persona's bot if we're live.
+    ui.on_persona_switched({
+        let w = ui_weak.clone();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let realtime = realtime.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                {
+                    if ui.get_rt_connected() {
+                        let url = bot_url_for(ui.global::<Persona>().get_index());
+                        ui.set_rt_failed(false);
+                        ui.set_rt_status("switching…".into());
+                        realtime.connect(url);
+                    }
+                }
             }
         }
     });

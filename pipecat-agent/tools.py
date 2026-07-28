@@ -191,6 +191,15 @@ def _fit_zoom(a, b, w=MAP_W, h=MAP_H, pad=1.35):
     return 2
 
 
+def _haversine_mi(lat1, lng1, lat2, lng2):
+    """Great-circle distance in miles — used to keep place results genuinely local."""
+    r = 3958.8
+    d1, d2 = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
+    x = (math.sin(d1 / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d2 / 2) ** 2)
+    return 2 * r * math.asin(min(1.0, math.sqrt(x)))
+
+
 async def _geocode(place, near=None):
     """Place/POI name -> (lat, lng); Seattle on failure.
 
@@ -200,30 +209,50 @@ async def _geocode(place, near=None):
     that region (proximity) so a same-named place three states over doesn't win.
     """
     prox = f"{near[1]},{near[0]}" if near else f"{SEATTLE[1]},{SEATTLE[0]}"
+    ref = near if near else SEATTLE
+
+    def _nearest(features):
+        # Of several candidates, pick the one CLOSEST to `ref` — so an ambiguous name
+        # ("Providence", "Main St") resolves to the local branch, not a same-named place
+        # across the country that merely ranked higher.
+        cands = []
+        for f in features:
+            g = (f.get("geometry") or {}).get("coordinates")
+            if g and len(g) >= 2:
+                cands.append((g[1], g[0]))  # geometry = [lng, lat]
+            else:
+                c = (f.get("properties") or {}).get("coordinates") or {}
+                if c.get("latitude") is not None:
+                    cands.append((c["latitude"], c["longitude"]))
+        if not cands:
+            return None
+        return min(cands, key=lambda c: _haversine_mi(ref[0], ref[1], c[0], c[1]))
+
     # 1) Search Box — best for landmarks / businesses / transit stops.
     try:
         data = await _get_json(
             "https://api.mapbox.com/search/searchbox/v1/forward",
-            params={"q": place, "limit": "1", "country": "US",
+            params={"q": place, "limit": "5", "country": "US",
                     "proximity": prox, "access_token": _mapbox()},
         )
-        feats = data.get("features") or []
-        if feats:
-            lng, lat = feats[0]["geometry"]["coordinates"]
-            return lat, lng
+        got = _nearest(data.get("features") or [])
+        if got:
+            return got
     except Exception:
         pass
     # 2) Fall back to the v6 address geocoder.
     try:
         data = await _get_json(
             "https://api.mapbox.com/search/geocode/v6/forward",
-            params={"q": place, "limit": "1", "country": "us",
+            params={"q": place, "limit": "5", "country": "us",
                     "proximity": prox, "access_token": _mapbox()},
         )
-        lng, lat = data["features"][0]["geometry"]["coordinates"]
-        return lat, lng
+        got = _nearest(data.get("features") or [])
+        if got:
+            return got
     except Exception:
-        return SEATTLE
+        pass
+    return SEATTLE
 
 
 # ------------------------------------------------------------------------- the tools
@@ -252,31 +281,69 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
         try:
             # center on the user's GPS unless they named a specific area
             clat, clng = (await _geocode(near, near=_here())) if near else _here()
-            data = await _get_json(
-                "https://api.mapbox.com/search/searchbox/v1/forward",
-                params={"q": q, "proximity": f"{clng},{clat}", "limit": "6",
-                        "access_token": _mapbox()},
-            )
+
             pins = []
-            for f in data.get("features", []):
-                p = f.get("properties", {})
-                c = p.get("coordinates") or {}
-                lat, lng = c.get("latitude"), c.get("longitude")
-                if lat is None or lng is None:
-                    g = f.get("geometry", {}).get("coordinates")
-                    if g:
-                        lng, lat = g[0], g[1]
-                if lat is None or lng is None:
-                    continue
-                pins.append({
-                    "name": p.get("name", ""),
-                    "note": (p.get("poi_category", [""])[0] if p.get("poi_category")
-                             else p.get("place_formatted", ""))[:38],
-                    "dist": "", "rating": 0, "x": 0, "y": 0,
-                    "lat": lat, "lng": lng,  # tap the place → open in Maps
-                })
-            # Numbered markers baked into the tile (so they always sit exactly on the map),
-            # auto-fit to frame them all. The card list below carries the same order.
+            # PRIMARY: Google Maps (via SerpApi). It anchors to the user's lat/lng (`ll`), so
+            # "coffee near me" returns actually-nearby spots — not a same-named place three states
+            # over (Mapbox's `proximity` only BIASES; it doesn't restrict). Falls back to Mapbox.
+            if _serpapi():
+                try:
+                    gm = await _get_json("https://serpapi.com/search", params={
+                        "engine": "google_maps", "type": "search", "q": q,
+                        "ll": f"@{clat},{clng},14z", "api_key": _serpapi(),
+                    })
+                    for r in gm.get("local_results", [])[:10]:
+                        g = r.get("gps_coordinates") or {}
+                        lat, lng = g.get("latitude"), g.get("longitude")
+                        if lat is None or lng is None:
+                            continue
+                        pins.append({
+                            "name": (r.get("title") or "")[:40],
+                            "note": (r.get("type") or r.get("address") or "")[:38],
+                            "dist": "", "rating": float(r["rating"]) if r.get("rating") else 0,
+                            "x": 0, "y": 0, "lat": lat, "lng": lng,
+                        })
+                except Exception:
+                    logger.exception("google_maps search failed; falling back to Mapbox")
+
+            # FALLBACK: Mapbox Search Box (proximity-biased).
+            if not pins:
+                data = await _get_json(
+                    "https://api.mapbox.com/search/searchbox/v1/forward",
+                    params={"q": q, "proximity": f"{clng},{clat}", "limit": "8",
+                            "access_token": _mapbox()},
+                )
+                for f in data.get("features", []):
+                    p = f.get("properties", {})
+                    c = p.get("coordinates") or {}
+                    lat, lng = c.get("latitude"), c.get("longitude")
+                    if lat is None or lng is None:
+                        gc = f.get("geometry", {}).get("coordinates")
+                        if gc:
+                            lng, lat = gc[0], gc[1]
+                    if lat is None or lng is None:
+                        continue
+                    pins.append({
+                        "name": p.get("name", ""),
+                        "note": (p.get("poi_category", [""])[0] if p.get("poi_category")
+                                 else p.get("place_formatted", ""))[:38],
+                        "dist": "", "rating": 0, "x": 0, "y": 0, "lat": lat, "lng": lng,
+                    })
+
+            # SAFETY NET: keep only genuinely-nearby results, nearest first — this is what kills
+            # the "across the country" outliers regardless of which provider answered.
+            for pn in pins:
+                pn["_mi"] = _haversine_mi(clat, clng, pn["lat"], pn["lng"])
+            pins = (sorted([p for p in pins if p["_mi"] <= 60], key=lambda p: p["_mi"])
+                    or sorted(pins, key=lambda p: p["_mi"]))[:8]
+            for pn in pins:
+                pn.pop("_mi", None)
+
+            if not pins:
+                await params.result_callback({"summary": f"Couldn't find any '{q}' near {near or 'you'}."})
+                return
+
+            # Numbered markers baked into the tile (so they sit exactly on the map), auto-fit.
             markers = ",".join(
                 f"pin-s-{i + 1}+ef4d2a({p['lng']},{p['lat']})" for i, p in enumerate(pins[:9])
             )
@@ -291,7 +358,7 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
                          center={"lat": clat, "lng": clng})
             names = ", ".join(p["name"] for p in pins[:3])
             await params.result_callback({
-                "summary": f"Found {len(pins)} spots for '{q}' near {near}. On the map now.",
+                "summary": f"Found {len(pins)} spots for '{q}' near {near or 'you'}. On the map now.",
                 "count": len(pins), "top": names,
             })
         except Exception as e:
@@ -472,14 +539,100 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
             logger.exception("start_navigation failed")
             await params.result_callback({"error": f"Couldn't start navigation: {e}"})
 
+    async def find_specialist(params):
+        # Kaira's tool: find nearby clinicians/clinics. Voice-only persona → returns a spoken-friendly
+        # summary (names, neighborhoods, distance). Google Maps (via SerpApi), anchored to the
+        # patient's lat/lng, gives the best clinic coverage; Mapbox is the fallback. Distance-filtered
+        # so a same-named practice in another state can't sneak into a medical referral.
+        a = params.arguments or {}
+        specialty = (a.get("specialty") or a.get("query") or "").strip()
+        near = a.get("near")
+        if not (_serpapi() or _mapbox()):
+            await params.result_callback({"error": "I can't look up clinics right now — maps aren't configured."})
+            return
+        try:
+            clat, clng = (await _geocode(near, near=_here())) if near else _here()
+            found = []
+            # PRIMARY: Google Maps, anchored to the patient (`ll`).
+            if _serpapi():
+                try:
+                    gm = await _get_json("https://serpapi.com/search", params={
+                        "engine": "google_maps", "type": "search", "q": specialty or "doctor",
+                        "ll": f"@{clat},{clng},13z", "api_key": _serpapi(),
+                    })
+                    for r in gm.get("local_results", [])[:12]:
+                        g = r.get("gps_coordinates") or {}
+                        lat, lng = g.get("latitude"), g.get("longitude")
+                        if lat is None or lng is None:
+                            continue
+                        addr = r.get("address") or ""
+                        city = addr.split(",")[1].strip() if "," in addr else (r.get("type") or "")
+                        found.append({
+                            "name": (r.get("title") or "")[:60], "area": city,
+                            "dist_mi": round(_haversine_mi(clat, clng, lat, lng), 1),
+                            "address": addr,
+                        })
+                except Exception:
+                    logger.exception("google_maps clinic search failed; falling back to Mapbox")
+            # FALLBACK: Mapbox Search Box.
+            if not found and _mapbox():
+                data = await _get_json(
+                    "https://api.mapbox.com/search/searchbox/v1/forward",
+                    params={"q": specialty or "doctor", "proximity": f"{clng},{clat}",
+                            "limit": "10", "country": "US", "access_token": _mapbox()},
+                )
+                for f in data.get("features", []):
+                    p = f.get("properties", {})
+                    name = p.get("name", "")
+                    if not name:
+                        continue
+                    c = p.get("coordinates") or {}
+                    lat, lng = c.get("latitude"), c.get("longitude")
+                    if lat is None or lng is None:
+                        g = f.get("geometry", {}).get("coordinates")
+                        if g:
+                            lng, lat = g[0], g[1]
+                    if lat is None or lng is None:
+                        continue
+                    found.append({
+                        "name": name,
+                        "area": (p.get("place_formatted") or "").split(",")[0].strip(),
+                        "dist_mi": round(_haversine_mi(clat, clng, lat, lng), 1),
+                        "address": p.get("full_address") or p.get("place_formatted") or "",
+                    })
+            # keep only genuinely-local results (drops same-name clinics states away), nearest first
+            picks = sorted([r for r in found if r["dist_mi"] is not None and r["dist_mi"] <= 75],
+                           key=lambda r: r["dist_mi"]) or sorted(found, key=lambda r: r.get("dist_mi") or 1e9)
+            if not picks:
+                await params.result_callback({
+                    "summary": f"I couldn't find any {specialty or 'clinics'} near {near or 'you'} — it "
+                               "may help to widen the area or check your insurance's provider directory.",
+                })
+                return
+
+            def _fmt(r):
+                area = f" in {r['area']}" if r["area"] else ""
+                dm = f", about {r['dist_mi']} miles away" if r.get("dist_mi") is not None else ""
+                return f"{r['name']}{area}{dm}"
+            listed = "; ".join(_fmt(r) for r in picks[:3])
+            await params.result_callback({
+                "summary": f"I found {len(picks)} option{'s' if len(picks) != 1 else ''} near "
+                           f"{near or 'you'}: {listed}. Want the address for any of them?",
+                "results": picks[:6],
+            })
+        except Exception as e:
+            logger.exception("find_specialist failed")
+            await params.result_callback({"error": f"I couldn't complete the specialist search: {e}"})
+
     llm.register_function("search_places", search_places)
     llm.register_function("search_web", search_web)
     llm.register_function("search_images", search_images)
     llm.register_function("search_products", search_products)
     llm.register_function("get_directions", get_directions)
     llm.register_function("start_navigation", start_navigation)
-    logger.info("Registered Nova tools: search_places, search_web, search_images, "
-                "search_products, get_directions, start_navigation")
+    llm.register_function("find_specialist", find_specialist)
+    logger.info("Registered tools: search_places, search_web, search_images, search_products, "
+                "get_directions, start_navigation, find_specialist")
 
 
 # ---------------------------------------------------------------- schemas (pure data)
@@ -533,6 +686,50 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
                      "only when the user clearly wants to GO / start driving there now."),
         properties={
             "destination": {"type": "string", "description": "Where to navigate to."},
+            "mode": {"type": "string", "enum": ["driving", "walking", "cycling", "transit"],
+                     "description": "Travel mode. Defaults to driving."},
+        },
+        required=["destination"],
+    ),
+])
+
+
+# Kaira's tool set — just the specialist/clinic lookup. Her prompt runs the consultation; this
+# lets her point the patient to who to see and where to go, as part of the triage handoff.
+KAIRA_TOOLS = ToolsSchema(standard_tools=[
+    FunctionSchema(
+        name="find_specialist",
+        description=("Find nearby clinicians or clinics for the patient — a specialist, physical "
+                     "therapist, urgent care, GP, and so on. Use it when they want to know WHO to "
+                     "see or WHERE to go. Ask for their area first if you don't already know it."),
+        properties={
+            "specialty": {"type": "string",
+                          "description": "The kind of clinician or clinic, e.g. 'orthopedic specialist', "
+                                         "'physical therapist', 'urgent care', 'cardiologist', 'family doctor'."},
+            "near": {"type": "string",
+                     "description": "Area to search near, e.g. 'Everett, WA'. Defaults to the patient's location."},
+        },
+        required=["specialty"],
+    ),
+    FunctionSchema(
+        name="get_directions",
+        description=("Show a route on the MAP to a clinic or address, with ETA and distance. Use "
+                     "after finding a clinic when the patient wants to know how to get there or how "
+                     "far it is. Does NOT start turn-by-turn — use start_navigation for that."),
+        properties={
+            "destination": {"type": "string",
+                            "description": "The clinic or place to route to, e.g. 'EvergreenHealth Urgent Care, Mill Creek'."},
+            "mode": {"type": "string", "enum": ["driving", "walking", "cycling", "transit"],
+                     "description": "Travel mode. Defaults to driving."},
+        },
+        required=["destination"],
+    ),
+    FunctionSchema(
+        name="start_navigation",
+        description=("Open the phone's maps app for live turn-by-turn directions to a clinic. Use "
+                     "only when the patient clearly wants to GO there now."),
+        properties={
+            "destination": {"type": "string", "description": "The clinic or place to navigate to."},
             "mode": {"type": "string", "enum": ["driving", "walking", "cycling", "transit"],
                      "description": "Travel mode. Defaults to driving."},
         },
