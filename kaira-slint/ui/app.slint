@@ -78,6 +78,8 @@ export global VS {
     // Mirror of the OS "Reduce Motion" accessibility setting (set from Rust). Looping/idle
     // animations (breathe, pulses) go still when true; transient transitions stay.
     in-out property <bool> reduce-motion: false;
+    // Nova called end_call (user said goodbye) → hang up once her sign-off finishes playing.
+    in-out property <bool> hangup-armed: false;
 
     // --- onboarding + permissions (see src/permissions.rs) ---
     in-out property <bool> onboarding-open: false;  // first-run intro + permission-priming overlay
@@ -1951,7 +1953,16 @@ export component MainWindow inherits Window {
         if (root.user-active) { root.thinking = false; thinking-delay.running = false; }
         else if (root.rt-live && !root.agent-active) { thinking-delay.running = true; }
     }
-    changed agent-active => { if (root.agent-active) { root.thinking = false; } }
+    changed agent-active => {
+        if (root.agent-active) { root.thinking = false; hangup-grace.running = false; }
+        // Nova finished her sign-off → after a short grace, hang up (if end_call armed it).
+        else if (VS.hangup-armed) { hangup-grace.running = true; }
+    }
+    // end_call may land while she's already quiet (or a silent hangup) → arm the grace then too.
+    property <bool> hangup-armed-watch: VS.hangup-armed;
+    changed hangup-armed-watch => {
+        if (VS.hangup-armed && !root.agent-active) { hangup-grace.running = true; }
+    }
     // Kaira talking-animation frame cursor (advanced by kaira-talk-timer while she speaks).
     property <int> kaira-frame: 0;
     property <[image]> kaira-talk: [
@@ -2003,6 +2014,7 @@ export component MainWindow inherits Window {
     callback open-url(string);  // open a URL in the phone (product store page, map location, …)
     callback focus-pin(float, float);  // tap a place in the list → fly the interactive map to it (lat, lng)
     callback interrupt-nova();  // tap the waveform to cut Nova off mid-sentence
+    callback hang-up();         // Nova ended the call (user said goodbye) → drop the session
     callback pick-image();      // tap the upload button → open the iOS photo picker
     callback save-setting(string, string);  // persist a setting (key, value) to the app's files dir
     callback request-permissions();  // prompt for mic (+ location) in-app; result lands in VS.mic-perm
@@ -2037,6 +2049,15 @@ export component MainWindow inherits Window {
         interval: 8s;
         running: false;
         triggered => { root.thinking = false; self.running = false; }
+    }
+    // After end_call, wait ~1s past Nova's last words so her sign-off plays in full, then hang up.
+    hangup-grace := Timer {
+        interval: 1000ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if (VS.hangup-armed) { VS.hangup-armed = false; root.hang-up(); }
+        }
     }
     // Advances Kaira's talking frames (~11fps) while she is actually speaking.
     kaira-talk-timer := Timer {

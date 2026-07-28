@@ -526,6 +526,11 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True, user_id: st
             logger.exception("search_videos failed")
             await params.result_callback({"error": f"Video search choked: {e}"})
 
+    async def end_call(params):
+        # Drop the session (the client plays Nova's sign-off first, then disconnects).
+        await ui.end_call()
+        await params.result_callback({"summary": "Ended the call."})
+
     async def get_weather(params):
         loc = (params.arguments or {}).get("location")
         await _filler("get_weather")
@@ -828,6 +833,7 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True, user_id: st
     llm.register_function("search_videos", search_videos)
     llm.register_function("search_products", search_products)
     llm.register_function("get_weather", get_weather)
+    llm.register_function("end_call", end_call)
     llm.register_function("get_directions", get_directions)
     llm.register_function("start_navigation", start_navigation)
     llm.register_function("find_specialist", find_specialist)
@@ -886,6 +892,15 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
             "location": {"type": "string",
                          "description": "City or place to check, e.g. 'Portland' or 'Ballard'. Omit for the user's current location."},
         },
+        required=[],
+    ),
+    FunctionSchema(
+        name="end_call",
+        description=("Hang up / end the voice call. Call this ONLY when the user clearly wants to stop talking — "
+                     "'bye', 'goodbye', 'talk later', 'that's all', 'I'm done', 'we're done', 'end the call', "
+                     "'catch you later'. Say a SHORT sign-off first, then call this in the SAME turn. Do NOT call "
+                     "it just because the conversation paused."),
+        properties={},
         required=[],
     ),
     FunctionSchema(

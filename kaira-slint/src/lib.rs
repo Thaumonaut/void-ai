@@ -765,6 +765,9 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
         "close_view" => close_view(ui, &sget("view")),
         "collapse" => vs.set_collapsed(bget("on", true)),
         "fullscreen" => vs.set_fullscreen(bget("on", true)),
+        // Nova decided the conversation is over (user said goodbye) → arm the hangup; the UI drops
+        // the session once her sign-off finishes playing (see hangup-grace in app.slint).
+        "end_call" | "hangup" => vs.set_hangup_armed(true),
         "images" => {
             // History: each search APPENDS a tab instead of replacing, so you can flip back
             // through the session's searches (capped to IMAGE_TAB_LIMIT). sync_images then paints
@@ -1935,6 +1938,23 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
             ios_haptics::tap();
             #[cfg(any(target_os = "android", target_os = "ios"))]
             realtime.interrupt();
+        }
+    });
+
+    // Nova ended the call (user said goodbye) → drop the realtime session. Fired by the UI once
+    // her sign-off has played (hangup-grace), so we don't cut her off mid-farewell.
+    ui.on_hang_up({
+        let w = ui_weak.clone();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let realtime = realtime.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                ui.set_rt_connected(false);
+            }
+            #[cfg(target_os = "ios")]
+            ios_haptics::tap();
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            realtime.disconnect();
         }
     });
 

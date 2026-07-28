@@ -55,6 +55,10 @@ class UiBridge:
     async def fullscreen(self, on: bool = True) -> None:
         await self._send("fullscreen", on=on)
 
+    async def end_call(self) -> None:
+        # Hang up. The client waits for the agent's sign-off to finish before dropping the session.
+        await self._send("end_call")
+
     # --- content (each opens + switches its view; collapse=True also collapses Nova) ---
     async def images(
         self, items: list, query: Optional[str] = None,
