@@ -27,7 +27,11 @@ mod ios_web;
 #[cfg(target_os = "ios")]
 mod ios_video;
 #[cfg(target_os = "ios")]
+mod ios_keyboard;
+#[cfg(target_os = "ios")]
 mod ios_haptics;
+#[cfg(target_os = "ios")]
+mod ios_soundcheck;
 // Talk (realtime WebRTC) runs on Android + iOS. Lab (sherpa STT/TTS) is Android-only.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 mod realtime;
@@ -1159,6 +1163,98 @@ fn render_chat(ui: &MainWindow) {
         .set_chat_turns(ModelRc::from(Rc::new(VecModel::from(out))));
 }
 
+// "Ask Nova" / chat-composer plumbing. When a session is started from a content view (or a typed
+// question), the connect URL carries the on-screen context as `&seed=…`; the bot opens on it. When
+// already live, the same context/text is injected mid-session over the data channel. UI-thread only.
+thread_local! {
+    static PENDING_SEED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static PENDING_MUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Append `&seed=<url-encoded>` to an offer URL (proper encoding via `reqwest::Url`).
+fn with_seed(base: String, seed: &str) -> String {
+    let seed = seed.trim();
+    if seed.is_empty() {
+        return base;
+    }
+    match reqwest::Url::parse(&base) {
+        Ok(mut u) => {
+            u.query_pairs_mut().append_pair("seed", seed);
+            u.to_string()
+        }
+        Err(_) => base,
+    }
+}
+
+/// A short, natural-language summary of what's on the active view — the context Nova gets when the
+/// user taps "Ask Nova". Empty for views with nothing to ask about (chat/weather/unknown). Capped
+/// so it stays well within URL-length limits as a `seed=` query param.
+fn screen_context(ui: &MainWindow) -> String {
+    let vs = ui.global::<VS>();
+    let s = match vs.get_current_view().as_str() {
+        "products" => {
+            let mut items = Vec::new();
+            if let Some(m) = vs.get_products().as_any().downcast_ref::<VecModel<Product>>() {
+                for i in 0..m.row_count().min(6) {
+                    if let Some(p) = m.row_data(i) {
+                        items.push(format!("{} — {} ({})", p.name, p.price, p.store));
+                    }
+                }
+            }
+            format!("shopping results for \"{}\": {}", vs.get_products_query(), items.join("; "))
+        }
+        "web" => {
+            let mut gist = String::new();
+            if let Some(m) = vs.get_web_blocks().as_any().downcast_ref::<VecModel<Block>>() {
+                for i in 0..m.row_count().min(3) {
+                    if let Some(b) = m.row_data(i) {
+                        gist.push_str(b.text.as_str());
+                        gist.push(' ');
+                    }
+                }
+            }
+            format!(
+                "a web page titled \"{}\" ({}). Gist: {}",
+                vs.get_web_title(),
+                vs.get_web_url(),
+                gist.trim()
+            )
+        }
+        "images" => format!(
+            "image search results for \"{}\" ({} images)",
+            vs.get_images_query(),
+            vs.get_images().row_count()
+        ),
+        "videos" => {
+            let playing = vs.get_playing_video_title();
+            if !playing.is_empty() {
+                format!("a video that's playing: \"{playing}\"")
+            } else {
+                format!(
+                    "video search results for \"{}\" ({} videos)",
+                    vs.get_videos_query(),
+                    vs.get_videos().row_count()
+                )
+            }
+        }
+        "map" => {
+            let mut names = Vec::new();
+            if let Some(m) = vs.get_pins().as_any().downcast_ref::<VecModel<MapPin>>() {
+                for i in 0..m.row_count().min(6) {
+                    if let Some(p) = m.row_data(i) {
+                        names.push(p.name.to_string());
+                    }
+                }
+            }
+            format!("a map for \"{}\" with places: {}", vs.get_map_query(), names.join(", "))
+        }
+        "docs" => format!("a document \"{}\", page {}", vs.get_doc_name(), vs.get_doc_page()),
+        _ => String::new(),
+    };
+    let s = s.trim();
+    s.chars().take(500).collect()
+}
+
 pub fn run_app() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
     let ui_weak = ui.as_weak();
@@ -1750,10 +1846,15 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         format!("{base}{sep}agent={agent}")
     }
 
+    // Lets the pre-connect sound gate re-enter realtime-toggle and skip the volume check the
+    // second time (so "Start talking" from the sound check actually connects).
+    let force_connect = std::rc::Rc::new(std::cell::Cell::new(false));
     ui.on_realtime_toggle({
         let w = ui_weak.clone();
         #[cfg(any(target_os = "android", target_os = "ios"))]
         let realtime = realtime.clone();
+        #[cfg(target_os = "ios")]
+        let force = force_connect.clone();
         move || {
             if let Some(ui) = w.upgrade() {
                 let now = !ui.get_rt_connected();
@@ -1781,6 +1882,20 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                             }
                             permissions::Perm::Granted => {}
                         }
+                        // Sound gate: if the volume is too low to hear Nova's opening line, pop the
+                        // sound check FIRST and connect only once the user proceeds (Start talking).
+                        #[cfg(target_os = "ios")]
+                        if !force.get() && ios_soundcheck::output_volume() < 0.3 {
+                            let vs = ui.global::<VS>();
+                            vs.set_sound_volume(ios_soundcheck::output_volume());
+                            vs.set_sound_route(ios_soundcheck::route());
+                            vs.set_soundcheck_gate(true);
+                            vs.set_soundcheck_open(true);
+                            ui.set_rt_connected(false);
+                            return;
+                        }
+                        #[cfg(target_os = "ios")]
+                        force.set(false);
                         ui.set_rt_connected(true);
                         // iOS: cpal can't capture until the AVAudioSession is active.
                         #[cfg(target_os = "ios")]
@@ -1796,9 +1911,21 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                         // Android emulator → host loopback for fast local dev.
                         let agent = ui.global::<Persona>().get_id();
                         let url = bot_url_for(ui.global::<Engine>().get_index(), agent.as_str());
+                        // "Ask Nova"/composer-initiated connect carries the on-screen context (or
+                        // typed question) as ?seed=, so Nova opens on it instead of the greeting.
+                        let url = PENDING_SEED.with(|s| match s.borrow_mut().take() {
+                            Some(seed) => with_seed(url, &seed),
+                            None => url,
+                        });
                         ui.set_rt_failed(false);
                         ui.set_rt_status("connecting…".into());
                         realtime.connect(url);
+                        // A typed-question-initiated session starts muted (they're typing, not
+                        // talking); they can unmute from the waveform any time.
+                        if PENDING_MUTE.with(|m| m.replace(false)) {
+                            realtime.set_muted(true);
+                            ui.global::<VS>().set_mic_muted(true);
+                        }
                     } else {
                         ui.set_rt_connected(false);
                         realtime.disconnect();
@@ -1941,6 +2068,60 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // "Ask Nova" pill (content views) → start/continue a session seeded with what's on screen.
+    ui.on_ask_nova({
+        let w = ui_weak.clone();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let realtime = realtime.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                #[cfg(target_os = "ios")]
+                ios_haptics::tap();
+                let ctx = screen_context(&ui);
+                if ctx.is_empty() {
+                    return;
+                }
+                if ui.get_rt_connected() {
+                    // Already in a session → inject the context now (a viewed image / playing
+                    // video is already shipped via the vision path, so Nova sees it too).
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    realtime.send_ask_context(ctx);
+                } else {
+                    // Not connected → connect seeded with the context (drives Nova's opening).
+                    PENDING_SEED.with(|s| *s.borrow_mut() = Some(ctx));
+                    ui.invoke_realtime_toggle();
+                }
+            }
+        }
+    });
+
+    // Chat composer → send a typed question to Nova (type instead of speak).
+    ui.on_send_text({
+        let w = ui_weak.clone();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let realtime = realtime.clone();
+        move |text: slint::SharedString| {
+            if let Some(ui) = w.upgrade() {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                ui.global::<VS>().set_composer_text("".into()); // clear the field
+                if ui.get_rt_connected() {
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    realtime.send_user_text(text);
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    let _ = text;
+                } else {
+                    // Not connected → connect seeded with the question, mic muted (they're typing).
+                    PENDING_SEED.with(|s| *s.borrow_mut() = Some(text));
+                    PENDING_MUTE.with(|m| m.set(true));
+                    ui.invoke_realtime_toggle();
+                }
+            }
+        }
+    });
+
     // Nova ended the call (user said goodbye) → drop the realtime session. Fired by the UI once
     // her sign-off has played (hangup-grace), so we don't cut her off mid-farewell.
     ui.on_hang_up({
@@ -2008,6 +2189,114 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
 
     // Take a blocked user to this app's OS Settings page so they can flip the mic switch.
     ui.on_open_app_settings(move || permissions::open_app_settings());
+
+    // Sound check: read the phone's media output volume + audio route into VS so the overlay can
+    // show a live meter and route-aware guidance (polled while the overlay is open).
+    ui.on_refresh_sound({
+        let w = ui_weak.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                let vs = ui.global::<VS>();
+                #[cfg(target_os = "ios")]
+                {
+                    vs.set_sound_volume(ios_soundcheck::output_volume());
+                    vs.set_sound_route(ios_soundcheck::route());
+                }
+                #[cfg(not(target_os = "ios"))]
+                {
+                    // desktop/Android stub: pretend a healthy speaker so the UI is exercisable.
+                    vs.set_sound_volume(0.8);
+                    vs.set_sound_route(0);
+                }
+            }
+        }
+    });
+
+    // Ultrasonic loopback test: play an ~18 kHz tone + record, detect whether the phone hears it.
+    ui.on_run_loopback({
+        let w = ui_weak.clone();
+        move || {
+            if let Some(ui) = w.upgrade() {
+                let vs = ui.global::<VS>();
+                vs.set_sound_testing(true);
+                vs.set_sound_loopback(0);
+            }
+            #[cfg(target_os = "ios")]
+            {
+                let w2 = w.clone();
+                ios_soundcheck::run_loopback(move |detected, ratio| {
+                    if let Some(ui) = w2.upgrade() {
+                        let vs = ui.global::<VS>();
+                        vs.set_sound_testing(false);
+                        vs.set_sound_loopback(if detected { 1 } else { 2 });
+                        vs.set_sound_ratio(ratio as f32);
+                    }
+                });
+            }
+            #[cfg(not(target_os = "ios"))]
+            if let Some(ui) = w.upgrade() {
+                let vs = ui.global::<VS>();
+                vs.set_sound_testing(false);
+                vs.set_sound_loopback(1);
+                vs.set_sound_ratio(9.9);
+            }
+        }
+    });
+
+    ui.on_play_chime(|| {
+        #[cfg(target_os = "ios")]
+        ios_soundcheck::play_chime();
+    });
+
+    // Continuous loopback: on the built-in speaker (with mic granted) run the 18 kHz tone + mic
+    // measurement while the overlay is open, pushing the live signal-vs-noise margin into VS.
+    ui.on_soundcheck_start({
+        let w = ui_weak.clone();
+        move || {
+            #[cfg(target_os = "ios")]
+            if let Some(ui) = w.upgrade() {
+                let speaker = ios_soundcheck::route() != 1;
+                let mic_ok = permissions::mic_status() == permissions::Perm::Granted;
+                ui.global::<VS>().set_sound_live(false);
+                ui.global::<VS>().set_sound_ok(false);
+                ui.global::<VS>().set_sound_margin(0.0);
+                if speaker && mic_ok {
+                    let w2 = w.clone();
+                    ios_soundcheck::start_live(move |_sig, noise, ratio| {
+                        if let Some(ui) = w2.upgrade() {
+                            let vs = ui.global::<VS>();
+                            vs.set_sound_ratio(ratio);
+                            vs.set_sound_noise(noise);
+                            vs.set_sound_margin((ratio / 2.0).min(1.0));
+                            vs.set_sound_ok(ratio > 2.0);
+                            vs.set_sound_live(true);
+                        }
+                    });
+                }
+            }
+            #[cfg(not(target_os = "ios"))]
+            let _ = &w;
+        }
+    });
+    ui.on_soundcheck_stop(|| {
+        #[cfg(target_os = "ios")]
+        {
+            ios_soundcheck::stop_live();
+        }
+    });
+
+    // The user dismissed the pre-connect sound gate ("Start talking") → re-enter the connect flow,
+    // this time forcing past the volume check.
+    ui.on_sound_continue({
+        let w = ui_weak.clone();
+        let force = force_connect.clone();
+        move || {
+            force.set(true);
+            if let Some(ui) = w.upgrade() {
+                ui.invoke_realtime_toggle();
+            }
+        }
+    });
 
     // ---- audio visualizer: a rolling signed-level history the strip renders as a
     // scrolling waveform. + = Nova speaking, − = the user speaking, 0 = idle. A Slint
@@ -2231,6 +2520,28 @@ pub fn run_app() -> Result<(), slint::PlatformError> {
                 })
                 .unwrap_or(false);
             ios_video::set_hidden(obscured || !playing);
+        });
+    }
+
+    // iOS: keyboard avoidance for the chat composer — report the keyboard height so the UI lifts
+    // above it, and dismiss it on demand (winit/Slint don't inset for the keyboard on iOS).
+    #[cfg(target_os = "ios")]
+    {
+        let w = ui_weak.clone();
+        ios_keyboard::set_on_height(move |h: f64| {
+            let w = w.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.global::<VS>().set_keyboard_height(h as f32);
+                }
+            });
+        });
+        ios_keyboard::observe();
+        let w2 = ui_weak.clone();
+        ui.on_dismiss_keyboard(move || {
+            if let Some(ui) = w2.upgrade() {
+                ios_keyboard::dismiss(ui.window());
+            }
         });
     }
 

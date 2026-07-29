@@ -75,7 +75,7 @@ coreaudio-sys = { version = "0.2.18", features = ["audio_unit", "audio_toolbox",
 # CoreLocation (CLLocationManager) → the phone's GPS, sent to the bot so directions start
 # from where the user is (mirrors the Android LocationManager path in native_stt).
 objc2-core-location = { version = "0.3", features = ["CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL", "NSError"] }
 # UIApplication.openURL → hand a maps/web URL off to the system browser / Maps app (iOS
 # analogue of the Android ACTION_VIEW intent in native_stt::launch_url).
 objc2-ui-kit = { version = "0.3", features = ["UIApplication", "UIView"] }

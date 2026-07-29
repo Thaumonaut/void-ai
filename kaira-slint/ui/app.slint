@@ -1,4 +1,4 @@
-import { Button, ComboBox, VerticalBox } from "std-widgets.slint";
+import { Button, ComboBox, VerticalBox, LineEdit } from "std-widgets.slint";
 // Space Mono is the whole typographic identity — embed it so it's the app font
 // everywhere (not just the Android system Roboto fallback).
 import "fonts/SpaceMono-Regular.ttf";
@@ -75,6 +75,7 @@ export global VS {
     in-out property <string> rail-pos: "right";   // which side the view-switcher rail sits on: "left" | "right"
     in-out property <bool> settings-open: false;   // the settings sheet (opened from the gear)
     in-out property <bool> addmenu-open: false;    // the "add a view" sheet (opened from the + button)
+    in-out property <bool> agentmenu-open: false;  // the agent menu (tap the full-screen avatar): mute · upload · end call
     // Mirror of the OS "Reduce Motion" accessibility setting (set from Rust). Looping/idle
     // animations (breathe, pulses) go still when true; transient transitions stay.
     in-out property <bool> reduce-motion: false;
@@ -86,6 +87,22 @@ export global VS {
     // OS permission state, mirrored from Rust: 0 = undetermined, 1 = granted, 2 = denied/blocked.
     in-out property <int> mic-perm: 0;
     in-out property <int> loc-perm: 0;
+
+    // --- sound check (make sure the user will hear Nova) — mirrored from Rust (refresh-sound) ---
+    in-out property <bool> soundcheck-open: false;
+    in-out property <float> sound-volume: 1.0;   // media output volume 0..1
+    in-out property <int> sound-route: 0;         // 0 = speaker · 1 = headphones/BT · 2 = other
+    // stage 2 — ultrasonic loopback + headphone chime confirm
+    in-out property <int> sound-loopback: 0;      // 0 = not run · 1 = phone heard itself · 2 = didn't
+    in-out property <bool> sound-testing: false;  // loopback test in progress
+    in-out property <float> sound-ratio: 0.0;     // measured 18k/16.5k ratio (debug/calibration)
+    in-out property <int> sound-chime: 0;         // headphone confirm: 0 = unasked · 1 = heard · 2 = not
+    in-out property <bool> soundcheck-gate: false; // overlay opened as a pre-connect gate → proceed on dismiss
+    // continuous live loopback (updates ~3×/sec while the overlay is open on the speaker)
+    in-out property <bool> sound-live: false;      // live measurement running
+    in-out property <float> sound-margin: 0.0;     // 0..1 meter fill (18k signal vs room noise)
+    in-out property <bool> sound-ok: false;        // signal clears the noise floor → good to go
+    in-out property <float> sound-noise: 0.0;      // room noise floor (raw rms, for the readout)
 
     // --- content (populated by Nova's tools / live transcript) ---
     in-out property <[ChatTurn]> chat-turns;
@@ -141,6 +158,8 @@ export global VS {
     // which view Nova is actively fetching for ("" = none); shows a "working" pill until content lands.
     in-out property <string> working-view;
     in-out property <string> working-label;
+    in-out property <string> composer-text;  // chat text-composer buffer (cleared by Rust on send)
+    in-out property <length> keyboard-height; // iOS soft-keyboard height → lift the UI above it
     in-out property <bool> map-failed;      // the static map tile couldn't load (tap to retry)
 
     // --- user actions the UI can't do alone (Rust mutates the open-views model) ---
@@ -215,6 +234,10 @@ export global Ico {
     out property <string> chev-down: "M6 9 L12 15 L18 9";
     out property <string> mic: "M12 3 A3 3 0 0 0 9 6 V11 A3 3 0 0 0 15 11 V6 A3 3 0 0 0 12 3 Z M6 11 A6 6 0 0 0 18 11 M12 17 V21 M9 21 H15";
     out property <string> power: "M12 3 V11 M7.5 6.3 A6.5 6.5 0 1 0 16.5 6.3";
+    // Drawn X / check — Space Mono has no ✕/✓ glyph, so font text renders as the missing-glyph box.
+    out property <string> close: "M6 6 L18 18 M6 18 L18 6";
+    out property <string> check: "M5 12.5 L10 17.5 L19 7";
+    out property <string> stop: "M7.5 7 H16.5 A0.5 0.5 0 0 1 17 7.5 V16.5 A0.5 0.5 0 0 1 16.5 17 H7.5 A0.5 0.5 0 0 1 7 16.5 V7.5 A0.5 0.5 0 0 1 7.5 7 Z";
     // weather condition glyphs (clear reuses sun/moon)
     out property <string> wx-cloud: "M7 17.5 A3.8 3.8 0 0 1 7 10 A5 5 0 0 1 16.5 10.6 A3.4 3.4 0 0 1 16.5 17.5 Z";
     out property <string> wx-partly: "M7.5 8.5 A2.6 2.6 0 1 1 7.49 8.5 M7.5 3.4 V4.9 M3.4 8.5 H1.9 M4.2 5.2 L5.2 6.2 M10.8 5.2 L9.8 6.2 M9 18.5 A3.6 3.6 0 0 1 9 11.5 A4.8 4.8 0 0 1 18 12 A3.2 3.2 0 0 1 18 18.5 Z";
@@ -336,6 +359,26 @@ component WorkingPill inherits Rectangle {
             horizontal-alignment: center;
         }
     }
+}
+
+// Compact "Ask {agent}" pill for content-view headers/toolbars — tap to start (or continue) a
+// session seeded with what's on screen. Lives in Slint chrome that sits ABOVE any native WKWebView
+// (web/video/map), so it stays tappable. Exposes `clicked`; each view wires it to `ask-nova()`.
+component AskNovaPill inherits Rectangle {
+    callback clicked;
+    width: anp-lbl.width + 26px;
+    height: 30px;
+    border-radius: 15px;
+    background: anp-ta.pressed ? VS.orange.darker(0.18) : VS.orange;
+    anp-lbl := Text {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: "✦ Ask \{Persona.name}";
+        color: white;
+        font-size: 12.5px;
+        font-weight: 700;
+    }
+    anp-ta := TouchArea { clicked => { root.clicked(); } }
 }
 
 // Shown inside the waveform pill when the conversation is paused (mic muted): a calm row of dim
@@ -534,18 +577,15 @@ component SwitchBtn inherits Rectangle {
 // Full-screen agent control, drawn as the live persona avatar (replaces the plain power icon):
 // breathes, tracks Kaira's talk frames, pulses on your mic, persona-accent ring when connected.
 // Disconnected → tap connects. Connected → tap pauses/unpauses (and barges in if she's mid-
-// sentence); hold (long-press) disconnects. A grey ring + dim shows the paused state.
+// sentence); hold (long-press) opens the agent menu (mute · upload · end call). Grey ring + dim = paused.
 component RailAgentBtn inherits Rectangle {
     in property <bool> connected;
     in property <bool> talking;                  // agent-active
     in property <bool> listening;                // mic-active
     in property <int> frame;                     // kaira-frame
     in property <[image]> talk-frames;           // kaira-talk
-    callback connect-toggle();                   // connect / disconnect the realtime session
-    callback mic-mute(bool);                     // pause (true) / unpause (false)
-    callback interrupt();                        // barge-in while she's talking
+    callback connect-toggle();                   // connect (tap when disconnected)
     property <bool> paused: root.connected && VS.mic-muted;
-    property <bool> did-long: false;
     width: 48px;
     height: 48px;
     property <bool> breathe: false;
@@ -553,15 +593,6 @@ component RailAgentBtn inherits Rectangle {
         interval: 2200ms;
         running: !VS.reduce-motion;
         triggered => { root.breathe = !root.breathe; }
-    }
-    hold := Timer {
-        interval: 500ms;
-        running: false;
-        triggered => {
-            self.running = false;
-            root.did-long = true;
-            if (root.connected) { root.connect-toggle(); }   // hold → disconnect
-        }
     }
     Rectangle {
         width: 40px;
@@ -602,19 +633,11 @@ component RailAgentBtn inherits Rectangle {
             Rectangle { width: 2px; height: 7px; border-radius: 1px; background: white; y: (parent.height - self.height) / 2; }
         }
     }
+    // tap: connect when off; when connected, open/close the agent menu (mute · upload · end call).
     ta := TouchArea {
         clicked => {
-            if (!root.did-long) {
-                if (!root.connected) { root.connect-toggle(); }                       // tap → connect
-                else if (VS.mic-muted) { VS.mic-muted = false; root.mic-mute(false); } // unpause
-                else if (root.talking) { root.interrupt(); }                          // barge-in
-                else { VS.mic-muted = true; root.mic-mute(true); }                    // pause
-            }
-            root.did-long = false;
-        }
-        pointer-event(e) => {
-            if (e.kind == PointerEventKind.down) { root.did-long = false; hold.running = true; }
-            if (e.kind == PointerEventKind.up || e.kind == PointerEventKind.cancel) { hold.running = false; }
+            if (!root.connected) { root.connect-toggle(); }
+            else { VS.agentmenu-open = !VS.agentmenu-open; }
         }
     }
 }
@@ -642,6 +665,8 @@ component SwitcherRail inherits VerticalLayout {
     }
     // in full-screen the bottom bar + strip are gone, so surface the essentials here.
     // The agent avatar is the control: tap connects / pauses+unpauses, hold disconnects.
+    // Tap the avatar → the agent menu (mute · upload · end call). The mic + attach buttons that
+    // used to sit here moved INTO that menu, freeing the rail for view icons.
     if VS.fullscreen: RailAgentBtn {
         connected: root.rt-connected;
         talking: root.rt-agent-active;
@@ -649,17 +674,6 @@ component SwitcherRail inherits VerticalLayout {
         frame: root.rt-frame;
         talk-frames: root.rt-talk;
         connect-toggle => { root.realtime-toggle(); }
-        mic-mute(m) => { root.mic-mute(m); }
-        interrupt => { root.interrupt-nova(); }
-    }
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.mic;
-        active: VS.mic-muted;
-        tapped => { VS.mic-muted = !VS.mic-muted; root.mic-mute(VS.mic-muted); }
-    }
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.attach;
-        tapped => { root.pick-image(); }
     }
     Rectangle { width: 20px; height: 1px; background: VS.line; }
     Flickable {
@@ -715,6 +729,8 @@ component SwitcherRailH inherits HorizontalLayout {
         active: VS.fullscreen;
         tapped => { VS.fullscreen = !VS.fullscreen; }
     }
+    // Tap the avatar → the agent menu (mute · upload · end call). The mic + attach buttons moved
+    // into that menu, freeing the rail for view icons.
     if VS.fullscreen: RailAgentBtn {
         connected: root.rt-connected;
         talking: root.rt-agent-active;
@@ -722,17 +738,6 @@ component SwitcherRailH inherits HorizontalLayout {
         frame: root.rt-frame;
         talk-frames: root.rt-talk;
         connect-toggle => { root.realtime-toggle(); }
-        mic-mute(m) => { root.mic-mute(m); }
-        interrupt => { root.interrupt-nova(); }
-    }
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.mic;
-        active: VS.mic-muted;
-        tapped => { VS.mic-muted = !VS.mic-muted; root.mic-mute(VS.mic-muted); }
-    }
-    if VS.fullscreen: SwitchBtn {
-        d: Ico.attach;
-        tapped => { root.pick-image(); }
     }
     Rectangle { width: 1px; height: 20px; background: VS.line; y: (parent.height - self.height) / 2; }
     Flickable {
@@ -776,6 +781,9 @@ component ActiveView inherits Rectangle {
     callback retry-image(int);
     callback retry-product(int);
     callback retry-map();
+    callback ask-nova();         // "Ask Nova" pill → start/continue seeded with what's on screen
+    callback send-text(string);  // chat composer → send a typed question
+    callback dismiss-keyboard(); // resign the composer's keyboard (iOS)
     background: VS.card;
     border-radius: VS.radius;
     border-width: 1px;
@@ -783,7 +791,9 @@ component ActiveView inherits Rectangle {
     clip: true;
 
                                 // -- chat --
-                                if VS.current-view == "chat": Flickable {
+                                if VS.current-view == "chat": VerticalLayout {
+                                    Flickable {
+                                    vertical-stretch: 1;
                                     viewport-width: self.width;
                                     viewport-height: chat-col.preferred-height + 8px;
                                     viewport-y: min(0px, self.height - (chat-col.preferred-height + 8px));
@@ -884,6 +894,58 @@ component ActiveView inherits Rectangle {
                                             }
                                         }
                                     }
+                                    }
+                                    // Chat composer — type a question to Nova instead of speaking. Sending when
+                                    // not connected starts a session seeded with the question (mic muted).
+                                    Rectangle {
+                                        height: 58px;
+                                        background: VS.card;
+                                        Rectangle { y: 0; width: 100%; height: 1px; background: VS.line; }
+                                        HorizontalLayout {
+                                            padding: 11px;
+                                            spacing: 8px;
+                                            // Dismiss the keyboard (shown only while it's up).
+                                            if VS.keyboard-height > 0px: Rectangle {
+                                                width: 36px;
+                                                border-radius: 10px;
+                                                background: kbdismiss.pressed ? VS.line : VS.url-bg;
+                                                Text {
+                                                    text: "⌄";
+                                                    color: VS.ink2;
+                                                    font-size: 20px;
+                                                    font-weight: 800;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                    width: 100%;
+                                                    height: 100%;
+                                                }
+                                                kbdismiss := TouchArea { clicked => { root.dismiss-keyboard(); } }
+                                            }
+                                            composer-input := LineEdit {
+                                                horizontal-stretch: 1;
+                                                placeholder-text: "Type to \{Persona.name}…";
+                                                text <=> VS.composer-text;
+                                                font-size: 14px;
+                                                accepted(t) => { root.send-text(t); }
+                                            }
+                                            Rectangle {
+                                                width: 44px;
+                                                border-radius: 10px;
+                                                background: VS.composer-text != "" ? VS.orange : VS.line;
+                                                Text {
+                                                    text: "↑";
+                                                    color: white;
+                                                    font-size: 19px;
+                                                    font-weight: 800;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                    width: 100%;
+                                                    height: 100%;
+                                                }
+                                                TouchArea { clicked => { root.send-text(VS.composer-text); } }
+                                            }
+                                        }
+                                    }
                                 }
 
                                 // -- images --
@@ -901,10 +963,15 @@ component ActiveView inherits Rectangle {
                                         padding: VS.gut;
                                         spacing: VS.gap;
                                         alignment: start;
-                                        Text {
-                                            text: "FOUND \{VS.images.length} · \"\{VS.images-query}\"";
-                                            color: VS.ink3;
-                                            font-size: 11px;
+                                        HorizontalLayout {
+                                            Text {
+                                                text: "FOUND \{VS.images.length} · \"\{VS.images-query}\"";
+                                                color: VS.ink3;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            AskNovaPill { clicked => { root.ask-nova(); } }
                                         }
                                         // Search history: one chip per past image search — tap to flip back.
                                         if VS.image-tabs > 1: Flickable {
@@ -998,10 +1065,15 @@ component ActiveView inherits Rectangle {
                                     // query chip — a floating-looking pill instead of a full bar + divider
                                     if VS.map-query != "": Rectangle {
                                         height: 48px;
+                                        mappill := AskNovaPill {
+                                            x: parent.width - self.width - VS.gut;
+                                            y: (parent.height - self.height) / 2;
+                                            clicked => { root.ask-nova(); }
+                                        }
                                         Rectangle {
                                             x: VS.gut;
                                             y: (parent.height - self.height) / 2;
-                                            width: parent.width - VS.gut * 2;
+                                            width: parent.width - VS.gut * 2 - mappill.width - 8px;
                                             height: 36px;
                                             border-radius: 18px;
                                             background: VS.url-bg;
@@ -1222,7 +1294,10 @@ component ActiveView inherits Rectangle {
                                         padding-bottom: VS.gut;
                                         spacing: VS.gap;
                                         alignment: start;
-                                        Text { text: "SHOPPING · \"\{VS.products-query}\" · \{VS.products.length} stores"; color: VS.ink3; font-size: 11px; }
+                                        HorizontalLayout {
+                                            Text { text: "SHOPPING · \"\{VS.products-query}\" · \{VS.products.length} stores"; color: VS.ink3; font-size: 11px; vertical-alignment: center; horizontal-stretch: 1; }
+                                            AskNovaPill { clicked => { root.ask-nova(); } }
+                                        }
                                         // big cards like the images: large photo on top, details below (≈1 in view, scroll for more)
                                         for p[i] in VS.products: Rectangle {
                                             height: 268px;
@@ -1324,6 +1399,14 @@ component ActiveView inherits Rectangle {
                                             }
                                             // address
                                             Text { text: VS.web-url; color: VS.ink3; font-size: 12.5px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                            // Ask Nova about this page
+                                            Rectangle {
+                                                width: askpill.width;
+                                                askpill := AskNovaPill {
+                                                    y: (parent.height - self.height) / 2;
+                                                    clicked => { root.ask-nova(); }
+                                                }
+                                            }
                                             // Nova's take toggle (iOS only — flips between the live page and the summary)
                                             if VS.has-web-reader: Rectangle {
                                                 width: takelbl.width + 24px;
@@ -1420,7 +1503,7 @@ component ActiveView inherits Rectangle {
                                                         Text { text: title; color: VS.ink; font-size: 13px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                                         Rectangle {
                                                             width: 34px;
-                                                            Text { text: "\u{2715}"; color: VS.ink3; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                                            Icon { width: 12px; height: 12px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.close; ink: VS.ink3; sw: 1.8px; }
                                                             TouchArea { clicked => { VS.close-web-tab(i); } }
                                                         }
                                                     }
@@ -1480,10 +1563,15 @@ component ActiveView inherits Rectangle {
                                         padding: VS.gut;
                                         spacing: VS.gap;
                                         alignment: start;
-                                        Text {
-                                            text: "FOUND \{VS.videos.length} · \"\{VS.videos-query}\"";
-                                            color: VS.ink3;
-                                            font-size: 11px;
+                                        HorizontalLayout {
+                                            Text {
+                                                text: "FOUND \{VS.videos.length} · \"\{VS.videos-query}\"";
+                                                color: VS.ink3;
+                                                font-size: 11px;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                            }
+                                            AskNovaPill { clicked => { root.ask-nova(); } }
                                         }
                                         // Search history chips — tap to flip back to a past search.
                                         if VS.video-tabs > 1: Flickable {
@@ -1708,10 +1796,11 @@ component ActiveView inherits Rectangle {
                                         HorizontalLayout {
                                             padding-left: 34px;
                                             padding-right: 12px;
-                                            spacing: 6px;
+                                            spacing: 8px;
                                             alignment: center;
                                             Text { text: VS.doc-name; color: VS.ink; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; }
                                             Text { text: VS.doc-page; color: VS.ink3; font-size: 11px; vertical-alignment: center; }
+                                            AskNovaPill { clicked => { root.ask-nova(); } }
                                         }
                                         Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: VS.line; }
                                     }
@@ -1864,7 +1953,7 @@ export component MainWindow inherits Window {
     // (add-view sheet, settings, lightbox, product sheet) would be hidden behind it. Tell Rust to
     // hide the webview while any such overlay is up, and re-show it when they all close.
     callback set-map-obscured(bool);
-    property <bool> map-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
+    property <bool> map-obscured: VS.addmenu-open || VS.agentmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
     changed map-obscured => { self.set-map-obscured(self.map-obscured); }
     property <bool> map-active: VS.current-view == "map";
     changed map-active => { self.map-active-changed(self.map-active); }
@@ -1875,7 +1964,7 @@ export component MainWindow inherits Window {
     callback report-web-geom(length, length, length, length);
     callback web-active-changed(bool);
     callback set-web-obscured(bool);
-    property <bool> web-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open
+    property <bool> web-obscured: VS.addmenu-open || VS.agentmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open
         || VS.web-take-open || VS.web-tabsw-open || VS.web-menu-open;
     changed web-obscured => { self.set-web-obscured(self.web-obscured); }
     property <bool> web-active: VS.current-view == "web";
@@ -1886,7 +1975,7 @@ export component MainWindow inherits Window {
     callback report-video-geom(length, length, length, length);
     callback video-active-changed(bool);
     callback set-video-obscured(bool);
-    property <bool> video-obscured: VS.addmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
+    property <bool> video-obscured: VS.addmenu-open || VS.agentmenu-open || VS.settings-open || VS.lightbox-open || VS.pd-open;
     changed video-obscured => { self.set-video-obscured(self.video-obscured); }
     property <bool> video-active: VS.current-view == "videos" && VS.playing-video-id != "";
     changed video-active => { self.video-active-changed(self.video-active); }
@@ -1963,6 +2052,12 @@ export component MainWindow inherits Window {
     changed hangup-armed-watch => {
         if (VS.hangup-armed && !root.agent-active) { hangup-grace.running = true; }
     }
+    // Start/stop the continuous loopback with the sound-check overlay.
+    property <bool> soundcheck-open-watch: VS.soundcheck-open;
+    changed soundcheck-open-watch => {
+        if (VS.soundcheck-open) { root.soundcheck-start(); }
+        else { root.soundcheck-stop(); }
+    }
     // Kaira talking-animation frame cursor (advanced by kaira-talk-timer while she speaks).
     property <int> kaira-frame: 0;
     property <[image]> kaira-talk: [
@@ -2016,9 +2111,18 @@ export component MainWindow inherits Window {
     callback interrupt-nova();  // tap the waveform to cut Nova off mid-sentence
     callback hang-up();         // Nova ended the call (user said goodbye) → drop the session
     callback pick-image();      // tap the upload button → open the iOS photo picker
+    callback ask-nova();        // "Ask Nova" pill → connect/continue seeded with on-screen context
+    callback send-text(string); // chat composer → send a typed question to Nova
+    callback dismiss-keyboard();          // resign the composer's keyboard (iOS)
     callback save-setting(string, string);  // persist a setting (key, value) to the app's files dir
     callback request-permissions();  // prompt for mic (+ location) in-app; result lands in VS.mic-perm
     callback open-app-settings();    // open this app's OS Settings page (recover a blocked mic)
+    callback refresh-sound();        // re-read output volume + route into VS.sound-volume / sound-route
+    callback run-loopback();         // ultrasonic speaker→mic test → VS.sound-loopback / sound-ratio
+    callback play-chime();           // audible chime for the headphone "did you hear that?" confirm
+    callback sound-continue();       // dismissed the pre-connect sound gate → go ahead and connect
+    callback soundcheck-start();     // overlay opened on the speaker → begin the continuous loopback
+    callback soundcheck-stop();      // overlay closed → stop the loopback + release the audio session
 
     preferred-width: 400px;
     preferred-height: 800px;
@@ -2081,10 +2185,12 @@ export component MainWindow inherits Window {
                 background: VS.canvas;
                 VerticalLayout {
                     spacing: 0;
+                    // iOS: lift the whole app above the soft keyboard so the chat composer stays visible.
+                    padding-bottom: VS.keyboard-height;
 
                     // ===== app bar (orange extends under the status bar) =====
                     Rectangle {
-                        height: 96px;
+                        height: 110px;
                         background: @linear-gradient(180deg, VS.slab-hi 0%, VS.slab-lo 100%);
                         // row sits at the BOTTOM of the bar (clears the status bar up top, hugs the bar's base)
                         HorizontalLayout {
@@ -2093,6 +2199,7 @@ export component MainWindow inherits Window {
                             y: parent.height - self.height - 6px;
                             padding-left: VS.gut;
                             padding-right: VS.gut;
+                            padding-bottom: 5px;
                             // no alignment:center — let the wordmark stretch so the icons anchor to the gutters
                             IconBtn { d: VS.dark ? Ico.moon : Ico.sun; tapped => { VS.dark = !VS.dark; } }
                             Text {
@@ -2428,7 +2535,7 @@ export component MainWindow inherits Window {
                                 interrupt-nova => { root.interrupt-nova(); }
                                 pick-image => { root.pick-image(); }
                             }
-                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { horizontal-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } ask-nova() => { root.ask-nova(); } send-text(t) => { root.send-text(t); } dismiss-keyboard() => { root.dismiss-keyboard(); } }
                             if VS.rail-pos == "right": SwitcherRail {
                                 on-left: false; rt-connected: root.rt-connected;
                                 rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
@@ -2455,7 +2562,7 @@ export component MainWindow inherits Window {
                                 interrupt-nova => { root.interrupt-nova(); }
                                 pick-image => { root.pick-image(); }
                             }
-                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } }
+                            ActiveView { vertical-stretch: 1; open-url(u) => { root.open-url(u); } focus-pin(la, ln) => { root.focus-pin(la, ln); } report-map-geom(x, y, w, h) => { root.report-map-geom(x, y, w, h); } report-web-geom(x, y, w, h) => { root.report-web-geom(x, y, w, h); } report-video-geom(x, y, w, h) => { root.report-video-geom(x, y, w, h); } retry-image(i) => { root.retry-image(i); } retry-product(i) => { root.retry-product(i); } retry-map() => { root.retry-map(); } ask-nova() => { root.ask-nova(); } send-text(t) => { root.send-text(t); } dismiss-keyboard() => { root.dismiss-keyboard(); } }
                             if VS.rail-pos == "bottom": SwitcherRailH {
                                 drop-down: false; rt-connected: root.rt-connected;
                                 rt-agent-active: root.agent-active; rt-mic-active: root.mic-active;
@@ -2605,7 +2712,7 @@ export component MainWindow inherits Window {
                         width: 48px; height: 48px;
                         x: parent.width - 54px; y: 40px;
                         Rectangle { width: 40px; height: 40px; x: 4px; y: 4px; border-radius: 20px; background: #ffffff26;
-                            Text { text: "\u{2715}"; color: white; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; } }
+                            Icon { width: 15px; height: 15px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.close; ink: white; sw: 2px; } }
                         TouchArea { clicked => { VS.lightbox-open = false; lb.zoom = 1.0; lb.czoom = 1.0; lb.panx = 0px; lb.pany = 0px; } }
                     }
                 }
@@ -2644,7 +2751,7 @@ export component MainWindow inherits Window {
                                     height: 34px;
                                     border-radius: 17px;
                                     background: #00000073;
-                                    Text { text: "✕"; color: white; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                    Icon { width: 14px; height: 14px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.close; ink: white; sw: 2px; }
                                     TouchArea { clicked => { VS.pd-open = false; } }
                                 }
                             }
@@ -2697,6 +2804,84 @@ export component MainWindow inherits Window {
                     }
                 }
 
+
+                // agent menu — a root-level bottom sheet (never covered by a native webview; the
+                // *-obscured props hide those while it's open). Opened by tapping the full-screen
+                // avatar; holds the controls that used to be separate rail icons.
+                if VS.agentmenu-open: Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: #00000099;
+                    TouchArea { clicked => { VS.agentmenu-open = false; } }   // tap the scrim → close
+                    Rectangle {
+                        width: min(parent.width - 40px, 420px);
+                        x: (parent.width - self.width) / 2;
+                        height: agcol.preferred-height;
+                        y: parent.height - self.height - 28px;
+                        border-radius: VS.radius;
+                        background: VS.card;
+                        border-width: 1px;
+                        border-color: VS.cardline;
+                        clip: true;
+                        TouchArea { }   // swallow taps on the sheet
+                        agcol := VerticalLayout {
+                            padding: 10px;
+                            spacing: 2px;
+                            alignment: start;
+                            Rectangle {
+                                height: 34px;
+                                Text {
+                                    x: 12px; height: 100%; vertical-alignment: center;
+                                    text: Persona.name-upper; color: VS.ink3; font-size: 11px; font-weight: 800; letter-spacing: 2px;
+                                }
+                            }
+                            // Mute / Unmute
+                            Rectangle {
+                                height: 52px; border-radius: 12px;
+                                background: am-mute.pressed ? VS.url-bg : transparent;
+                                HorizontalLayout {
+                                    padding-left: 14px; padding-right: 12px; spacing: 13px;
+                                    Rectangle { width: 22px; Icon { width: 20px; height: 20px; x: 0; y: (parent.height - self.height) / 2; d: Ico.mic; ink: VS.mic-muted ? VS.orange : VS.ink2; sw: 1.8px; } }
+                                    Text { text: VS.mic-muted ? "Unmute mic" : "Mute mic"; color: VS.ink; font-size: 15px; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                                am-mute := TouchArea { clicked => { VS.mic-muted = !VS.mic-muted; root.mic-mute(VS.mic-muted); VS.agentmenu-open = false; } }
+                            }
+                            // Stop <persona> (barge-in) — only while she's talking
+                            if root.agent-active: Rectangle {
+                                height: 52px; border-radius: 12px;
+                                background: am-stop.pressed ? VS.url-bg : transparent;
+                                HorizontalLayout {
+                                    padding-left: 14px; padding-right: 12px; spacing: 13px;
+                                    Rectangle { width: 22px; Icon { width: 17px; height: 17px; x: 0; y: (parent.height - self.height) / 2; d: Ico.stop; ink: VS.ink2; sw: 1.8px; } }
+                                    Text { text: "Stop \{Persona.name}"; color: VS.ink; font-size: 15px; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                                am-stop := TouchArea { clicked => { root.interrupt-nova(); VS.agentmenu-open = false; } }
+                            }
+                            // Upload image
+                            Rectangle {
+                                height: 52px; border-radius: 12px;
+                                background: am-up.pressed ? VS.url-bg : transparent;
+                                HorizontalLayout {
+                                    padding-left: 14px; padding-right: 12px; spacing: 13px;
+                                    Rectangle { width: 22px; Icon { width: 20px; height: 20px; x: 0; y: (parent.height - self.height) / 2; d: Ico.attach; ink: VS.ink2; sw: 1.8px; } }
+                                    Text { text: "Upload image"; color: VS.ink; font-size: 15px; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                                am-up := TouchArea { clicked => { root.pick-image(); VS.agentmenu-open = false; } }
+                            }
+                            // End call (destructive)
+                            Rectangle {
+                                height: 52px; border-radius: 12px;
+                                background: am-end.pressed ? #e5484d22 : transparent;
+                                HorizontalLayout {
+                                    padding-left: 14px; padding-right: 12px; spacing: 13px;
+                                    Rectangle { width: 22px; Icon { width: 20px; height: 20px; x: 0; y: (parent.height - self.height) / 2; d: Ico.power; ink: #e5484d; sw: 1.9px; } }
+                                    Text { text: "End call"; color: #e5484d; font-size: 15px; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                                am-end := TouchArea { clicked => { VS.agentmenu-open = false; root.hang-up(); } }
+                            }
+                        }
+                    }
+                }
 
                 // "add a view" sheet — a root-level overlay (not a PopupWindow) so the native
                 // Mapbox webview never covers it on iOS. Opened from the + button in either rail.
@@ -2764,7 +2949,8 @@ export component MainWindow inherits Window {
                     TouchArea { clicked => { VS.settings-open = false; } }
                     Rectangle {
                         width: min(parent.width - 40px, 420px);
-                        height: 430px;
+                        // fit the content (grew with the Sound check row), capped to the screen
+                        height: min(parent.height - 40px, setcol.preferred-height);
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         border-radius: VS.radius;
@@ -2773,7 +2959,7 @@ export component MainWindow inherits Window {
                         border-color: VS.cardline;
                         clip: true;
                         TouchArea { }
-                        VerticalLayout {
+                        setcol := VerticalLayout {
                             padding: 22px;
                             spacing: 18px;
                             alignment: start;
@@ -2782,7 +2968,7 @@ export component MainWindow inherits Window {
                                 Rectangle {
                                     width: 34px; height: 34px; border-radius: 17px;
                                     background: sx-ta.pressed ? VS.url-bg : transparent;
-                                    Text { text: "\u{2715}"; color: VS.ink2; font-size: 17px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                    Icon { width: 14px; height: 14px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.close; ink: VS.ink2; sw: 2px; }
                                     sx-ta := TouchArea { clicked => { VS.settings-open = false; } }
                                 }
                             }
@@ -2864,6 +3050,16 @@ export component MainWindow inherits Window {
                             Rectangle { height: 1px; background: VS.line; }
                             Rectangle {
                                 height: 48px; border-radius: 11px;
+                                background: sc-ta.pressed ? VS.url-bg : transparent;
+                                HorizontalLayout {
+                                    padding-left: 4px; padding-right: 4px;
+                                    Text { text: "Sound check"; color: VS.ink2; font-size: 13px; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text { text: "\u{203A}"; color: VS.ink3; font-size: 20px; vertical-alignment: center; }
+                                }
+                                sc-ta := TouchArea { clicked => { VS.settings-open = false; root.refresh-sound(); VS.soundcheck-open = true; } }
+                            }
+                            Rectangle {
+                                height: 48px; border-radius: 11px;
                                 background: lab-ta.pressed ? VS.url-bg : transparent;
                                 HorizontalLayout {
                                     padding-left: 4px; padding-right: 4px;
@@ -2871,6 +3067,162 @@ export component MainWindow inherits Window {
                                     Text { text: "\u{203A}"; color: VS.ink3; font-size: 20px; vertical-alignment: center; }
                                 }
                                 lab-ta := TouchArea { clicked => { VS.settings-open = false; root.tab = 1; } }
+                            }
+                        }
+                    }
+                }
+
+                // Sound check — make sure the user will actually hear Nova. Stage 1: a live volume
+                // meter + route-aware guidance (poll refresh-sound while open). Stage 2 adds the
+                // ~18 kHz loopback + a headphone chime confirm.
+                if VS.soundcheck-open: scroot := Rectangle {
+                    property <float> thresh: 0.3;   // below this, volume is "too low"
+                    property <bool> low: VS.sound-volume < self.thresh;
+                    property <bool> headphones: VS.sound-route == 1;
+                    property <bool> chimed: false;  // headphone confirm: has the chime been played yet
+                    width: 100%;
+                    height: 100%;
+                    background: #000000aa;
+                    // keep the volume + route readings live while this is open
+                    Timer {
+                        interval: 250ms;
+                        running: true;
+                        triggered => { root.refresh-sound(); }
+                    }
+                    TouchArea { clicked => { VS.soundcheck-open = false; VS.soundcheck-gate = false; } }   // scrim → dismiss/cancel
+                    Rectangle {
+                        width: min(parent.width - 40px, 420px);
+                        height: min(parent.height - 60px, 520px);
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: VS.radius;
+                        background: VS.card;
+                        border-width: 1px;
+                        border-color: VS.cardline;
+                        clip: true;
+                        TouchArea { }
+                        VerticalLayout {
+                            padding: 24px;
+                            spacing: 16px;
+                            alignment: start;
+                            Text { text: "SOUND CHECK"; color: VS.ink3; font-size: 12px; font-weight: 800; letter-spacing: 2px; }
+                            Text {
+                                text: scroot.headphones ? "You're on headphones"
+                                    : scroot.low ? "Turn up your volume"
+                                    : "Volume looks good";
+                                color: VS.ink; font-size: 24px; font-weight: 800;
+                            }
+                            Text {
+                                text: scroot.headphones
+                                    ? "You'll hear \{Persona.name} through your headphones — just make sure the level is comfortable before you start."
+                                    : scroot.low
+                                    ? "Your volume is low — nudge it up with the side buttons so you can hear \{Persona.name} clearly, especially in a noisy room."
+                                    : "You should hear \{Persona.name} loud and clear. Adjust with the side buttons if you like.";
+                                color: VS.ink2; font-size: 14px; wrap: word-wrap;
+                            }
+                            // live volume meter
+                            Rectangle {
+                                height: 16px;
+                                border-radius: 8px;
+                                background: VS.url-bg;
+                                Rectangle {
+                                    x: 0; y: 0;
+                                    width: parent.width * VS.sound-volume;
+                                    height: parent.height;
+                                    border-radius: 8px;
+                                    background: scroot.low ? #f5a623 : #34c759;
+                                    animate width { duration: 120ms; easing: ease-out; }
+                                }
+                                // threshold tick
+                                Rectangle { x: parent.width * scroot.thresh; width: 2px; height: parent.height; background: VS.ink3; opacity: 0.5; }
+                            }
+                            Text {
+                                text: "Volume · \{round(VS.sound-volume * 100)}%";
+                                color: VS.ink3; font-size: 12px;
+                            }
+                            // --- speaker: LIVE hearing-margin meter (18 kHz signal vs room noise) ---
+                            if !scroot.headphones && VS.mic-perm == 1: VerticalLayout {
+                                spacing: 8px;
+                                HorizontalLayout {
+                                    Text { text: "HEARING MARGIN"; color: VS.ink3; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text { text: VS.sound-ok ? "GOOD" : (VS.sound-live ? "LOW" : "…"); color: VS.sound-ok ? #34c759 : #f5a623; font-size: 10px; font-weight: 800; letter-spacing: 0.5px; vertical-alignment: center; }
+                                }
+                                Rectangle {
+                                    height: 16px; border-radius: 8px; background: VS.url-bg;
+                                    Rectangle {
+                                        x: 0; y: 0; width: parent.width * VS.sound-margin; height: parent.height; border-radius: 8px;
+                                        background: VS.sound-ok ? #34c759 : #f5a623;
+                                        animate width, background { duration: 180ms; easing: ease-out; }
+                                    }
+                                }
+                                Text {
+                                    text: VS.sound-ok ? "Nova will be heard clearly over the room."
+                                        : VS.sound-live ? "Turn the volume up until this bar goes green."
+                                        : "Listening for the phone over the room…";
+                                    color: VS.sound-ok ? #34c759 : VS.ink2; font-size: 13px; wrap: word-wrap;
+                                }
+                                Text { text: "signal \{round(VS.sound-ratio * 10) / 10}× room noise"; color: VS.ink3; font-size: 10px; }
+                            }
+                            if !scroot.headphones && VS.mic-perm != 1: Text {
+                                text: "Grant the microphone so the phone can check you'll hear Nova over the room.";
+                                color: VS.ink3; font-size: 12px; wrap: word-wrap;
+                            }
+                            // --- headphones: audible chime confirm ---
+                            if scroot.headphones: VerticalLayout {
+                                spacing: 8px;
+                                Rectangle {
+                                    height: 46px; border-radius: 12px;
+                                    background: ch-ta.pressed ? VS.url-bg : transparent;
+                                    border-width: 1px; border-color: VS.cardline;
+                                    Text { text: "Play a test sound"; color: VS.ink; font-size: 14px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                    ch-ta := TouchArea { clicked => { root.play-chime(); scroot.chimed = true; VS.sound-chime = 0; } }
+                                }
+                                if scroot.chimed: HorizontalLayout {
+                                    spacing: 8px;
+                                    Text { text: "Did you hear it?"; color: VS.ink2; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                                    Rectangle {
+                                        width: 62px; height: 36px; border-radius: 10px;
+                                        background: y-ta.pressed ? #34c75933 : VS.url-bg;
+                                        Text { text: "Yes"; color: VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        y-ta := TouchArea { clicked => { VS.sound-chime = 1; VS.soundcheck-open = false; if (VS.soundcheck-gate) { VS.soundcheck-gate = false; root.sound-continue(); } } }
+                                    }
+                                    Rectangle {
+                                        width: 56px; height: 36px; border-radius: 10px;
+                                        background: n-ta.pressed ? #ef4d2a33 : VS.url-bg;
+                                        Text { text: "No"; color: VS.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                        n-ta := TouchArea { clicked => { VS.sound-chime = 2; } }
+                                    }
+                                }
+                                if VS.sound-chime == 2: Text {
+                                    text: "Turn it up (or check the headphones are connected), then play it again.";
+                                    color: #f5a623; font-size: 12px; wrap: word-wrap;
+                                }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                            // primary: dismiss — and, when this was a pre-connect gate, go connect.
+                            // Turns green once the live meter says levels are good.
+                            Rectangle {
+                                height: 52px; border-radius: 15px;
+                                background: (VS.sound-ok && !scroot.headphones)
+                                    ? (sc-ok.pressed ? #2ea44f : #34c759)
+                                    : (sc-ok.pressed ? VS.orange.darker(0.15) : VS.orange);
+                                Text {
+                                    text: (VS.sound-ok && !scroot.headphones)
+                                        ? (VS.soundcheck-gate ? "Audio levels good — start talking" : "Audio levels good — continue")
+                                        : (VS.soundcheck-gate ? "Start talking" : "Sounds good");
+                                    color: white; font-size: 15px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%;
+                                }
+                                sc-ok := TouchArea { clicked => { VS.soundcheck-open = false; if (VS.soundcheck-gate) { VS.soundcheck-gate = false; root.sound-continue(); } } }
+                            }
+                            if VS.soundcheck-gate: Rectangle {
+                                height: 34px;
+                                Text { text: "Not now"; color: VS.ink3; font-size: 13px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                TouchArea { clicked => { VS.soundcheck-open = false; VS.soundcheck-gate = false; } }
+                            }
+                            if !VS.soundcheck-gate: Rectangle {
+                                height: 34px;
+                                Text { text: "Skip"; color: VS.ink3; font-size: 13px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                TouchArea { clicked => { VS.soundcheck-open = false; } }
                             }
                         }
                     }
@@ -2913,10 +3265,10 @@ export component MainWindow inherits Window {
                                     Text { text: "Microphone"; color: VS.ink; font-size: 15px; font-weight: 700; }
                                     Text { text: "Required — so \{Persona.name} can hear you speak."; color: VS.ink2; font-size: 13px; wrap: word-wrap; }
                                 }
-                                Text {
-                                    text: VS.mic-perm == 1 ? "✓" : VS.mic-perm == 2 ? "✕" : "";
-                                    color: VS.mic-perm == 2 ? #ff6b6b : #34c759;
-                                    font-size: 18px; font-weight: 800; vertical-alignment: center;
+                                Rectangle {
+                                    width: 22px;
+                                    if VS.mic-perm == 1: Icon { width: 18px; height: 18px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.check; ink: #34c759; sw: 2.4px; }
+                                    if VS.mic-perm == 2: Icon { width: 16px; height: 16px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.close; ink: #ff6b6b; sw: 2.4px; }
                                 }
                             }
                             HorizontalLayout {
@@ -2927,9 +3279,9 @@ export component MainWindow inherits Window {
                                     Text { text: "Location"; color: VS.ink; font-size: 15px; font-weight: 700; }
                                     Text { text: "Optional — so directions start from where you are."; color: VS.ink2; font-size: 13px; wrap: word-wrap; }
                                 }
-                                Text {
-                                    text: VS.loc-perm == 1 ? "✓" : "";
-                                    color: #34c759; font-size: 18px; font-weight: 800; vertical-alignment: center;
+                                Rectangle {
+                                    width: 22px;
+                                    if VS.loc-perm == 1: Icon { width: 18px; height: 18px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; d: Ico.check; ink: #34c759; sw: 2.4px; }
                                 }
                             }
                         }
@@ -2959,6 +3311,9 @@ export component MainWindow inherits Window {
                                     } else {
                                         root.save-setting("onboarding_seen", "1");
                                         VS.onboarding-open = false;
+                                        // straight into the sound check so the first thing Nova says is heard
+                                        root.refresh-sound();
+                                        VS.soundcheck-open = true;
                                     }
                                 }
                             }
@@ -3228,4 +3583,3 @@ export component MainWindow inherits Window {
         }
     }
 }
-

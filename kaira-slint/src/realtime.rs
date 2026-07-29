@@ -141,6 +141,12 @@ enum ViewSrc {
 }
 static VIEWING: Mutex<Option<ViewSrc>> = Mutex::new(None);
 
+// Text the UI wants to inject into the conversation over the data channel — a typed question
+// ({"type":"user_text"}) from the chat composer, or an "Ask Nova about this screen" context
+// ({"type":"ask_context"}). Queued here as ready-to-send JSON and drained + sent by the dc ping
+// loop, exactly like INTERRUPT_REQ / VIEWING.
+static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// An imported photo (no URL) — hand its base64 JPEG bytes to the bot so Nova can see it. A free
 /// function (not a method) so it's callable from the photo-picker's `Send` callback without
 /// holding the non-`Send` `Rc<Realtime>`; it just sets the global the dc ping loop drains.
@@ -186,6 +192,23 @@ impl Realtime {
     pub fn interrupt(&self) {
         FLUSH_PLAYBACK.store(true, Ordering::SeqCst);
         INTERRUPT_REQ.store(true, Ordering::SeqCst);
+    }
+    /// Queue a typed user question (chat composer) to inject as a user turn on the bot.
+    pub fn send_user_text(&self, text: String) {
+        Self::enqueue_text("user_text", text);
+    }
+    /// Queue the on-screen context ("Ask Nova about this") to inject mid-session.
+    pub fn send_ask_context(&self, text: String) {
+        Self::enqueue_text("ask_context", text);
+    }
+    fn enqueue_text(kind: &str, text: String) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        // serde_json handles the escaping (text can contain quotes / newlines / prices).
+        let msg = serde_json::json!({ "type": kind, "text": text }).to_string();
+        OUTBOX.lock().unwrap().push(msg);
     }
 }
 
@@ -476,6 +499,15 @@ async fn run_attempt(
                         };
                         let _ = ping_dc.send_text(msg).await;
                         eprintln!("[dc] sent viewing_image");
+                    }
+                    // Drain any queued typed-text / ask-context messages (chat composer / Ask Nova).
+                    let outbound: Vec<String> = {
+                        let mut q = OUTBOX.lock().unwrap();
+                        if q.is_empty() { Vec::new() } else { std::mem::take(&mut *q) }
+                    };
+                    for msg in outbound {
+                        let _ = ping_dc.send_text(msg).await;
+                        eprintln!("[dc] sent text message");
                     }
                     if ticks % 12 == 0 {
                         if ping_dc.send_text(format!("ping: {n}")).await.is_err() {
