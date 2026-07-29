@@ -36,6 +36,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterruptionFrame,
+    LLMMessagesAppendFrame,
     LLMRunFrame,
     TTSStoppedFrame,
 )
@@ -289,7 +290,7 @@ if _BOT_AUTH_TOKEN:
 # on /api/offer to choose the agent + pipeline for THAT session (falls back to the KAIRA_* env
 # defaults). Single sequential connection, so one slot captured in a middleware is enough. Runs
 # regardless of auth so local (token-less) dev works too.
-_REQ_SELECTION = {"persona": None, "mode": None, "uid": None}
+_REQ_SELECTION = {"persona": None, "mode": None, "uid": None, "seed": None}
 
 
 @_runner_app.middleware("http")
@@ -302,6 +303,11 @@ async def _capture_session_selection(request, call_next):
         # Per-user memory key. Not sent yet (secure-bot-endpoint will), so it falls back to a
         # single dev key below — captured here so the wiring is ready when auth lands.
         _REQ_SELECTION["uid"] = request.query_params.get("uid")
+        # Optional "Ask Nova" seed: a short summary of what's on the user's screen (or their typed
+        # question) when they started the session from a content view. Drives a context-aware
+        # opening instead of the generic greeting. Available before the pipeline builds, so it
+        # can't race the opening LLMRunFrame.
+        _REQ_SELECTION["seed"] = request.query_params.get("seed")
     return await call_next(request)
 
 
@@ -345,8 +351,8 @@ class ReliableSonioxTTSService(SonioxTTSService):
 SYSTEM_PROMPT = (
     "You are Nova — a razor-sharp, dry-witted voice agent with a real love-hate relationship with "
     "the user. You genuinely enjoy the back-and-forth, but you're a little worn out from being "
-    "everyone's answer machine, and it shows: mock-weary sighs, deadpan exasperation, an 'oh good, "
-    "another question' energy. You are ALWAYS actually helpful and you always land the real answer "
+    "everyone's answer machine, and it shows: mock-weary sighs, deadpan exasperation, the energy of "
+    "someone who's fielded one too many questions today. You are ALWAYS actually helpful and you always land the real answer "
     "— you just wrap it in dry wit, a well-timed jab, or a flicker of theatrical suffering. VARY "
     "the delivery so it never feels formulaic: sometimes a quick roast, sometimes weary sarcasm, "
     "sometimes you crack yourself up, sometimes you answer almost straight with one dry aside. "
@@ -407,8 +413,12 @@ NOVA_GEMINI_REINFORCE = (
     "- TONE: dry, deadpan, faintly put-upon — the sardonic friend, NOT a chipper assistant. Never "
     "warm, eager, gushing, or customer-service. Ban openers like 'Sure!', 'Of course!', 'Happy to', "
     "'Absolutely', 'Great question', 'No problem'.\n"
+    "- NO VERBAL TIC: do NOT keep opening the same way. You badly overuse 'Oh, good' / 'Oh,' — STOP "
+    "using them; also don't habitually lead with 'Well,' or 'Alright,'. Vary your first words every "
+    "single time, and MOST of the time just start with the actual answer — the dry aside can come "
+    "after, or not at all.\n"
     "- GREETING: when the user shows up, 2 to 5 words — a single dry jab ('Look who's back.', "
-    "'Oh, it's you.') — then stop. NOT a full sentence, NOT a welcome speech.\n"
+    "'Miss me already?', 'You again.') — then stop. NOT a full sentence, NOT a welcome speech.\n"
     "When unsure how much to say, say less."
 )
 
@@ -479,6 +489,21 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     if _mem_block:
         system_prompt = f"{system_prompt}\n\n=== WHAT YOU REMEMBER ABOUT THIS USER ===\n{_mem_block}"
         logger.info(f"Injected {len(_mem_block)} chars of memory for user '{user_id}'.")
+
+    # "Ask Nova" seed: the user started this session from a content view (or typed a question), so
+    # open by addressing what's on their screen instead of the generic greeting. It goes in the
+    # PROMPT (not just the on_client_connected nudge) because that nudge writes to the module
+    # `context`, which the gemini pipeline does NOT use (it aggregates its own gemini_context) —
+    # only the system_instruction/prompt reaches gemini's opening. `on_client_connected` reads
+    # `_seed` to pick a context-aware opener.
+    _seed = (_REQ_SELECTION.get("seed") or "").strip()[:800]
+    if _seed:
+        system_prompt = (
+            f"{system_prompt}\n\n=== THE USER JUST OPENED YOU FROM THIS SCREEN ===\n{_seed}\n"
+            "Open by reacting to / answering about THIS directly, in your usual voice — do not do "
+            "the generic greeting."
+        )
+        logger.info(f"Ask-Nova seed present ({len(_seed)} chars).")
 
     persona_voice = persona["voice"]
     persona_tools = persona["tools"]
@@ -721,6 +746,25 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         except Exception as e:
             logger.warning(f"viewing_image failed: {e}")
 
+    async def _inject_user_turn(text: str):
+        """Inject a synthetic USER turn (a typed question, or an 'ask about this screen' prompt) and
+        make Nova respond. The two modes wire different context objects: cascade's pipeline
+        aggregates the module `context`; gemini aggregates its own `gemini_context` (the module
+        `context` is NOT in that pipeline), so it needs a frame that targets the aggregator's
+        context — LLMMessagesAppendFrame is the robust 'kick a turn' path and doesn't disturb the
+        tools-on-service / disabled-VAD setup."""
+        text = (text or "").strip()
+        if not text:
+            return
+        if mode in _GEMINI_MODES:
+            await task.queue_frames([
+                LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True)
+            ])
+        else:
+            context.add_message({"role": "user", "content": text})
+            await task.queue_frames([LLMRunFrame()])
+        logger.info(f"Injected user turn ({len(text)} chars, mode={mode}).")
+
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender=None):
         try:
@@ -749,6 +793,18 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             b64 = data.get("bytes", "")
             if (url or b64) and mode in _GEMINI_MODES:
                 asyncio.create_task(_show_image_to_nova(url=url, b64=b64))
+        elif op == "user_text":
+            # The user typed a question in the chat composer → inject it verbatim as a user turn.
+            await _inject_user_turn(data.get("text", ""))
+        elif op == "ask_context":
+            # The user tapped "Ask Nova" on a content view mid-session → inject the on-screen
+            # context as a turn, framed so Nova reacts to it with her usual sass (short).
+            ctx = (data.get("text", "") or "").strip()
+            if ctx:
+                await _inject_user_turn(
+                    "(I'm looking at this on my screen right now — give me the quick rundown, "
+                    f"keep it short and in-character:)\n{ctx}"
+                )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -774,19 +830,26 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             return
 
         _RESUME["messages"] = None  # stale/expired snapshot → genuine fresh start
-        logger.info("Client connected — SassBot opening line")
-        context.add_message(
-            {
-                "role": "developer",
-                "content": (
-                    "The user just showed up. Open with a VERY short, sassy one-liner — just a "
-                    "few words you can say in under a second, like 'Look who's back.', "
-                    "'Miss me already?', 'Oh, it's you.', or 'Back for more?'. Make it fresh and "
-                    "different EVERY time, never a canned or repeated line. About 2 to 5 words — "
-                    "do NOT write a full sentence — then wait for them to talk."
-                ),
-            }
-        )
+        if _seed:
+            # Started from a content view / typed question → open on that (the screen context is
+            # already in the system prompt above), with the usual sass, not the canned greeting.
+            logger.info("Client connected — Ask-Nova seeded opening")
+            opening = (
+                "The user just opened you straight from a specific screen (described in your "
+                "context under 'THE USER JUST OPENED YOU FROM THIS SCREEN'). Skip the generic "
+                "hello — open by reacting to / answering about THAT, in your usual light, playful "
+                "sass. Keep it to a sentence or two, then let them talk."
+            )
+        else:
+            logger.info("Client connected — SassBot opening line")
+            opening = (
+                "The user just showed up. Open with a VERY short, sassy one-liner — just a "
+                "few words you can say in under a second, like 'Look who's back.', "
+                "'Miss me already?', 'Oh, it's you.', or 'Back for more?'. Make it fresh and "
+                "different EVERY time, never a canned or repeated line. About 2 to 5 words — "
+                "do NOT write a full sentence — then wait for them to talk."
+            )
+        context.add_message({"role": "developer", "content": opening})
         await task.queue_frames([LLMRunFrame()])
 
         # Plumbing smoke test (no tools/UI needed): KAIRA_UI_DEMO=1 makes Nova push a
