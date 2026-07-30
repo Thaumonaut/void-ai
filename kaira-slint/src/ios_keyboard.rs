@@ -64,9 +64,13 @@ unsafe fn keyboard_height(note: *mut AnyObject) -> f64 {
     if val.is_null() {
         return 0.0;
     }
-    // NSValue wrapping a CGRect (screen coords). Its height is what overlaps the bottom.
+    // NSValue wrapping the keyboard's end CGRect (screen coords). Report how much it OVERLAPS the
+    // screen bottom (screenH - frame.origin.y) — this is 0 while it animates off-screen on hide,
+    // so a single WillChangeFrame observer handles show + hide + interactive drag correctly.
     let rect: CGRect = msg_send![val, CGRectValue];
-    rect.size.height.max(0.0)
+    let screen: *mut AnyObject = msg_send![class!(UIScreen), mainScreen];
+    let bounds: CGRect = msg_send![screen, bounds];
+    (bounds.size.height - rect.origin.y).max(0.0)
 }
 
 fn host_view(window: &slint::Window) -> Option<*mut AnyObject> {

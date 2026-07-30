@@ -315,7 +315,26 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True, user_id: st
     key until secure-bot-endpoint supplies real per-user ids).
     """
 
+    # Which view each fetch-tool paints → its loading pill. (start_navigation / memory tools show
+    # no view, so they're absent and get no pill.)
+    _TOOL_UI = {
+        "search_places": ("map", "finding places…"),
+        "search_web": ("web", "searching…"),
+        "search_images": ("images", "finding images…"),
+        "search_videos": ("videos", "finding videos…"),
+        "get_weather": ("weather", "checking the weather…"),
+        "search_products": ("products", "shopping…"),
+        "get_directions": ("map", "planning a route…"),
+        "find_specialist": ("map", "finding a specialist…"),
+    }
+
     async def _filler(name):
+        # Loading pill FIRST — instant on-screen feedback the moment the tool fires (and the only
+        # quick signal on the duplex/S2S path, which has no spoken filler). Content clears it; the
+        # client also auto-clears on a timeout so an error can't leave it spinning.
+        vl = _TOOL_UI.get(name)
+        if vl:
+            await ui.working(view=vl[0], label=vl[1])
         if not speak_filler:
             return
         line = _pick_filler(name)

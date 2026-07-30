@@ -740,6 +740,12 @@ fn sync_web(ui: &MainWindow) {
     }
 }
 
+// Safety net for the "working" loading pill: a tool that ERRORS sends no content op to clear it,
+// so it would spin forever. Armed on each `working` op; auto-clears the pill after a timeout.
+thread_local! {
+    static WORKING_TIMER: std::cell::RefCell<Option<slint::Timer>> = const { std::cell::RefCell::new(None) };
+}
+
 fn apply_ui_control(ui: &MainWindow, data: &str) {
     let v: serde_json::Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -1082,6 +1088,25 @@ fn apply_ui_control(ui: &MainWindow, data: &str) {
                 vs.set_current_view(view.as_str().into());
                 vs.set_working_label(sget("label").into());
                 vs.set_working_view(view.as_str().into());
+                // Auto-clear if the tool errors and no content op ever lands to clear it.
+                let w = ui.as_weak();
+                let target = view.clone();
+                WORKING_TIMER.with(|t| {
+                    let timer = slint::Timer::default();
+                    timer.start(
+                        slint::TimerMode::SingleShot,
+                        std::time::Duration::from_secs(15),
+                        move || {
+                            if let Some(ui) = w.upgrade() {
+                                let vs = ui.global::<VS>();
+                                if vs.get_working_view().as_str() == target.as_str() {
+                                    vs.set_working_view("".into());
+                                }
+                            }
+                        },
+                    );
+                    *t.borrow_mut() = Some(timer);
+                });
             }
         }
         // plan-then-handoff: open the maps deep link in the phone's nav app

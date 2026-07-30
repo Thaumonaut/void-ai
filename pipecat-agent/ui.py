@@ -55,6 +55,13 @@ class UiBridge:
     async def fullscreen(self, on: bool = True) -> None:
         await self._send("fullscreen", on=on)
 
+    async def working(self, view: str, label: Optional[str] = None) -> None:
+        # Show a "Nova is working…" loading pill on `view` the instant a tool fires (before its
+        # results land) — instant feedback that covers the fetch gap, and the ONLY quick signal on
+        # the duplex/S2S path (which has no spoken filler). The content op clears it on success; the
+        # client also auto-clears after a timeout so an errored tool can't leave it spinning.
+        await self._send("working", view=view, label=label)
+
     async def end_call(self) -> None:
         # Hang up. The client waits for the agent's sign-off to finish before dropping the session.
         await self._send("end_call")
