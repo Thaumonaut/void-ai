@@ -132,6 +132,27 @@ static INTERRUPT_REQ: AtomicBool = AtomicBool::new(false);
 // Same tap flushes the LOCAL playback buffer so she goes silent instantly, instead of
 // draining the already-decoded audio while the bot's interrupt round-trips.
 static FLUSH_PLAYBACK: AtomicBool = AtomicBool::new(false);
+// The image the user is currently looking at (lightbox) — a searched image's URL, or the raw
+// bytes of an imported photo (base64 JPEG, no URL). The dc ping loop sends it to the bot as
+// {"type":"viewing_image"} so Nova (duplex/Gemini) can SEE it. Set by the UI; taken + sent once.
+enum ViewSrc {
+    Url(String),
+    Bytes(String), // base64-encoded JPEG of an imported photo
+}
+static VIEWING: Mutex<Option<ViewSrc>> = Mutex::new(None);
+
+// Text the UI wants to inject into the conversation over the data channel — a typed question
+// ({"type":"user_text"}) from the chat composer, or an "Ask Nova about this screen" context
+// ({"type":"ask_context"}). Queued here as ready-to-send JSON and drained + sent by the dc ping
+// loop, exactly like INTERRUPT_REQ / VIEWING.
+static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// An imported photo (no URL) — hand its base64 JPEG bytes to the bot so Nova can see it. A free
+/// function (not a method) so it's callable from the photo-picker's `Send` callback without
+/// holding the non-`Send` `Rc<Realtime>`; it just sets the global the dc ping loop drains.
+pub fn set_viewing_bytes(jpeg_b64: String) {
+    *VIEWING.lock().unwrap() = Some(ViewSrc::Bytes(jpeg_b64));
+}
 
 pub struct Realtime {
     tx: std::sync::mpsc::Sender<Cmd>,
@@ -162,11 +183,32 @@ impl Realtime {
     pub fn set_muted(&self, muted: bool) {
         MUTED.store(muted, Ordering::SeqCst);
     }
+    /// The user opened/switched to a searched image — hand its URL to the bot (empty = clear).
+    pub fn set_viewing(&self, url: String) {
+        *VIEWING.lock().unwrap() = if url.is_empty() { None } else { Some(ViewSrc::Url(url)) };
+    }
     /// User tapped the waveform to shut Nova up: flush the local playout NOW (instant
     /// silence) and ask the bot to stop generating (over the data channel).
     pub fn interrupt(&self) {
         FLUSH_PLAYBACK.store(true, Ordering::SeqCst);
         INTERRUPT_REQ.store(true, Ordering::SeqCst);
+    }
+    /// Queue a typed user question (chat composer) to inject as a user turn on the bot.
+    pub fn send_user_text(&self, text: String) {
+        Self::enqueue_text("user_text", text);
+    }
+    /// Queue the on-screen context ("Ask Nova about this") to inject mid-session.
+    pub fn send_ask_context(&self, text: String) {
+        Self::enqueue_text("ask_context", text);
+    }
+    fn enqueue_text(kind: &str, text: String) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        // serde_json handles the escaping (text can contain quotes / newlines / prices).
+        let msg = serde_json::json!({ "type": kind, "text": text }).to_string();
+        OUTBOX.lock().unwrap().push(msg);
     }
 }
 
@@ -443,6 +485,30 @@ async fn run_attempt(
                         let _ = ping_dc.send_text("{\"type\":\"interrupt\"}".to_string()).await;
                         eprintln!("[dc] sent interrupt");
                     }
+                    // The user opened an image → tell the bot so Nova can see it (Gemini vision).
+                    let viewing = VIEWING.lock().unwrap().take();
+                    if let Some(v) = viewing {
+                        let msg = match v {
+                            ViewSrc::Url(url) => {
+                                let esc = url.replace('\\', "\\\\").replace('"', "\\\"");
+                                format!("{{\"type\":\"viewing_image\",\"url\":\"{esc}\"}}")
+                            }
+                            ViewSrc::Bytes(b64) => {
+                                format!("{{\"type\":\"viewing_image\",\"bytes\":\"{b64}\"}}")
+                            }
+                        };
+                        let _ = ping_dc.send_text(msg).await;
+                        eprintln!("[dc] sent viewing_image");
+                    }
+                    // Drain any queued typed-text / ask-context messages (chat composer / Ask Nova).
+                    let outbound: Vec<String> = {
+                        let mut q = OUTBOX.lock().unwrap();
+                        if q.is_empty() { Vec::new() } else { std::mem::take(&mut *q) }
+                    };
+                    for msg in outbound {
+                        let _ = ping_dc.send_text(msg).await;
+                        eprintln!("[dc] sent text message");
+                    }
                     if ticks % 12 == 0 {
                         if ping_dc.send_text(format!("ping: {n}")).await.is_err() {
                             break;
@@ -703,6 +769,12 @@ async fn run_attempt(
     // RemoteIO can't, so a fan swamps the VAD and the bot echoes into the mic).
     #[cfg(target_os = "ios")]
     let vpio = crate::ios_vpio::start(play_q.clone(), mic_buf.clone(), mic_level.clone());
+    // Surface a hard capture failure (unit wouldn't start) to the UI — otherwise the peer
+    // still goes Live sending silence and a dead mic is indistinguishable from a quiet one.
+    #[cfg(target_os = "ios")]
+    if vpio.is_none() {
+        status("Microphone unavailable — check the app's mic access in Settings.".into());
+    }
     // Everything else: cpal mic capture + rodio playback on their own threads.
     #[cfg(not(target_os = "ios"))]
     let play_handle = {
@@ -715,7 +787,8 @@ async fn run_attempt(
         let mb = mic_buf.clone();
         let ms = stop.clone();
         let ml = mic_level.clone();
-        std::thread::spawn(move || mic_capture(mb, ms, ml))
+        let st = status.clone(); // let a hard capture failure reach the UI, not just the log
+        std::thread::spawn(move || mic_capture(mb, ms, ml, st))
     };
     // Push the mic level to the UI ~15×/s (read-and-reset so it decays when you stop).
     {
@@ -953,12 +1026,13 @@ fn play_thread(queue: Arc<Mutex<VecDeque<f32>>>, stop: Arc<AtomicBool>) {
 /// Capture the mic (cpal), downmix to mono, resample to 48 kHz, append to `buf`, and
 /// report the per-callback peak into `mic_level` for the UI meter. Verbose `[mic]`
 /// logging so `adb logcat` shows exactly where the input path breaks.
-fn mic_capture(buf: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>, mic_level: Arc<Mutex<f32>>) {
+fn mic_capture(buf: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>, mic_level: Arc<Mutex<f32>>, status: StatusCb) {
     let host = cpal::default_host();
     let device = match host.default_input_device() {
         Some(d) => d,
         None => {
             eprintln!("[mic] NO default input device — nothing to capture");
+            status("Microphone unavailable — check the app's mic access in Settings.".into());
             return;
         }
     };
@@ -967,6 +1041,7 @@ fn mic_capture(buf: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>, mic_level: Arc<
         Ok(c) => c,
         Err(e) => {
             eprintln!("[mic] default_input_config failed on '{name}': {e}");
+            status("Microphone unavailable — the mic could not be opened.".into());
             return;
         }
     };
@@ -1021,6 +1096,7 @@ fn mic_capture(buf: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>, mic_level: Arc<
         cpal::SampleFormat::U16 => build!(u16, |s: u16| (s as f32 - 32768.0) / 32768.0),
         other => {
             eprintln!("[mic] unsupported sample format {other:?} — cannot capture");
+            status("Microphone unavailable — unsupported audio format.".into());
             return;
         }
     };
@@ -1028,11 +1104,13 @@ fn mic_capture(buf: Arc<Mutex<Vec<f32>>>, stop: Arc<AtomicBool>, mic_level: Arc<
         Ok(s) => s,
         Err(e) => {
             eprintln!("[mic] build_input_stream failed: {e}");
+            status("Microphone unavailable — the mic could not be opened.".into());
             return;
         }
     };
     if let Err(e) = stream.play() {
         eprintln!("[mic] stream.play() failed: {e}");
+        status("Microphone unavailable — the mic could not be started.".into());
         return;
     }
     eprintln!("[mic] capturing…");

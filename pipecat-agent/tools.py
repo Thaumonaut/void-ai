@@ -15,6 +15,7 @@ the HANDLERS close over `ui` + `task` (which exist only after the pipeline is bu
 so they're registered later via register_tool_handlers().
 """
 
+import datetime
 import math
 import os
 import random
@@ -26,6 +27,8 @@ from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import TTSSpeakFrame
+
+import memory  # per-user fact store (remember / recall / forget)
 
 # Read keys at CALL time (not import time) — load_dotenv() runs after this module
 # may already be imported, so module-level os.getenv would capture None.
@@ -66,6 +69,44 @@ def _here():
     except (TypeError, ValueError):
         return SEATTLE
 
+
+# WMO weather codes → (label, condition id). The id maps to a line-icon + tint in the app
+# (Ico.wx / Ico.wx-tint): clear-day · clear-night · partly · cloudy · rain · snow · storm · fog.
+_WX = {
+    0: ("Clear", "clear"), 1: ("Mainly clear", "clear"), 2: ("Partly cloudy", "partly"),
+    3: ("Overcast", "cloudy"), 45: ("Fog", "fog"), 48: ("Rime fog", "fog"),
+    51: ("Light drizzle", "rain"), 53: ("Drizzle", "rain"), 55: ("Heavy drizzle", "rain"),
+    56: ("Freezing drizzle", "rain"), 57: ("Freezing drizzle", "rain"),
+    61: ("Light rain", "rain"), 63: ("Rain", "rain"), 65: ("Heavy rain", "rain"),
+    66: ("Freezing rain", "rain"), 67: ("Freezing rain", "rain"),
+    71: ("Light snow", "snow"), 73: ("Snow", "snow"), 75: ("Heavy snow", "snow"), 77: ("Snow grains", "snow"),
+    80: ("Rain showers", "rain"), 81: ("Rain showers", "rain"), 82: ("Heavy showers", "rain"),
+    85: ("Snow showers", "snow"), 86: ("Snow showers", "snow"),
+    95: ("Thunderstorm", "storm"), 96: ("Thunderstorm", "storm"), 99: ("Thunderstorm & hail", "storm"),
+}
+
+
+def _wx(code, is_day=True):
+    """(label, condition-id) for a WMO code; clear splits into day/night for the icon."""
+    label, cid = _WX.get(int(code), ("—", "cloudy"))
+    if cid == "clear":
+        cid = "clear-day" if is_day else "clear-night"
+    return label, cid
+
+
+def _fmt_hour(iso):
+    try:
+        return datetime.datetime.fromisoformat(iso).strftime("%I %p").lstrip("0")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _fmt_day(iso):
+    try:
+        return datetime.date.fromisoformat(iso[:10]).strftime("%a")
+    except (ValueError, TypeError):
+        return ""
+
 # One in-character line spoken the instant a tool fires (Layer-1 filler — kills dead
 # air while the network call runs). Randomized so it never feels canned.
 # Instant, in-character one-liners spoken the moment a tool fires, to cover the fetch with
@@ -101,6 +142,13 @@ FILLERS = {
         "Let me find something pretty for you to stare at.",
         "Loading up the visuals. Prepare to be mildly amazed.",
         "Curating a little gallery, just for you. Ugh.",
+    ],
+    "get_weather": [
+        "Checking the skies for you. Don't say I never look out for you.",
+        "Let me go poke the clouds and report back.",
+        "Consulting the weather gods on your behalf.",
+        "Pulling up the forecast. Spoiler: it's weather.",
+        "One sky report, coming right up.",
     ],
     "search_products": [
         "Off to do your shopping. The things I do for you.",
@@ -256,15 +304,37 @@ async def _geocode(place, near=None):
 
 
 # ------------------------------------------------------------------------- the tools
-def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
+def register_tool_handlers(llm, ui, task, speak_filler: bool = True, user_id: str = "default"):
     """Bind the handlers to this run's UiBridge + task and register them on the LLM.
 
     speak_filler: cascade mode pushes a TTSSpeakFrame filler line to cover the
     tool-fetch gap. In full-duplex/S2S mode (Ultravox) there is no TTS service in
     the pipeline and the S2S model covers the gap itself, so we skip it.
+
+    user_id: keys the per-user memory store for remember/recall/forget (single dev
+    key until secure-bot-endpoint supplies real per-user ids).
     """
 
+    # Which view each fetch-tool paints → its loading pill. (start_navigation / memory tools show
+    # no view, so they're absent and get no pill.)
+    _TOOL_UI = {
+        "search_places": ("map", "finding places…"),
+        "search_web": ("web", "searching…"),
+        "search_images": ("images", "finding images…"),
+        "search_videos": ("videos", "finding videos…"),
+        "get_weather": ("weather", "checking the weather…"),
+        "search_products": ("products", "shopping…"),
+        "get_directions": ("map", "planning a route…"),
+        "find_specialist": ("map", "finding a specialist…"),
+    }
+
     async def _filler(name):
+        # Loading pill FIRST — instant on-screen feedback the moment the tool fires (and the only
+        # quick signal on the duplex/S2S path, which has no spoken filler). Content clears it; the
+        # client also auto-clears on a timeout so an error can't leave it spinning.
+        vl = _TOOL_UI.get(name)
+        if vl:
+            await ui.working(view=vl[0], label=vl[1])
         if not speak_filler:
             return
         line = _pick_filler(name)
@@ -430,6 +500,130 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
         except Exception as e:
             logger.exception("search_images failed")
             await params.result_callback({"error": f"Image search choked: {e}"})
+
+    async def search_videos(params):
+        q = (params.arguments or {}).get("query", "")
+        await _filler("search_videos")
+        if not _serpapi():
+            await params.result_callback({"error": "Video search isn't set up yet (no SERPAPI_API_KEY)."})
+            return
+        try:
+            # YouTube via SerpApi → a browsable grid; each item plays in the app's embed player.
+            data = await _get_json("https://serpapi.com/search", params={
+                "engine": "youtube", "search_query": q, "api_key": _serpapi(),
+            })
+            items = []
+            for r in data.get("video_results", [])[:20]:
+                link = r.get("link", "")
+                # SerpApi gives a dedicated video_id; fall back to parsing the watch/shorts URL.
+                vid = r.get("video_id") or ""
+                if not vid and "watch?v=" in link:
+                    vid = link.split("watch?v=", 1)[1].split("&", 1)[0]
+                elif not vid and "/shorts/" in link:
+                    vid = link.split("/shorts/", 1)[1].split("?", 1)[0]
+                if not vid:
+                    continue  # need the id to build the embed player
+                # Clean, always-public thumbnail (SerpApi's static thumb is a signed,
+                # hotlink-protected i.ytimg URL that fails to fetch from the app).
+                thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                ch = r.get("channel")
+                channel = ch.get("name", "") if isinstance(ch, dict) else (ch or "")
+                items.append({
+                    "title": (r.get("title") or q)[:80],
+                    "channel": (channel or "")[:40],
+                    "dur": r.get("length") or "",
+                    "url": link or f"https://www.youtube.com/watch?v={vid}",
+                    "id": vid,
+                    "thumb": thumb,
+                })
+            if not items:
+                await params.result_callback({"error": f"No videos found for '{q}'."})
+                return
+            await ui.videos(items=items, query=q)
+            await params.result_callback({"summary": f"Found {len(items)} videos for '{q}'."})
+        except Exception as e:
+            logger.exception("search_videos failed")
+            await params.result_callback({"error": f"Video search choked: {e}"})
+
+    async def end_call(params):
+        # Drop the session (the client plays Nova's sign-off first, then disconnects).
+        await ui.end_call()
+        await params.result_callback({"summary": "Ended the call."})
+
+    async def get_weather(params):
+        loc = (params.arguments or {}).get("location")
+        await _filler("get_weather")
+        try:
+            label = None
+            if loc:
+                # Open-Meteo geocoding (keyless) — no Mapbox dependency for weather.
+                geo = await _get_json("https://geocoding-api.open-meteo.com/v1/search",
+                                      params={"name": loc, "count": 1})
+                res = (geo.get("results") or [])
+                if res:
+                    lat, lng = res[0]["latitude"], res[0]["longitude"]
+                    parts = [res[0].get("name"), res[0].get("admin1")]
+                    label = ", ".join([p for p in parts if p]) or loc
+                else:
+                    lat, lng = _here()
+                    label = loc
+            else:
+                lat, lng = _here()
+
+            data = await _get_json("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": lat, "longitude": lng,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day",
+                "hourly": "temperature_2m,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+                "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+                "timezone": "auto", "forecast_days": 7,
+            })
+            if label is None:  # no place named → use the timezone's city as a friendly label
+                tz = data.get("timezone", "")
+                label = tz.split("/")[-1].replace("_", " ") if "/" in tz else "Nearby"
+
+            cur = data.get("current", {})
+            is_day = bool(cur.get("is_day", 1))
+            cond, cid = _wx(cur.get("weather_code", 0), is_day)
+            temp = round(cur.get("temperature_2m", 0))
+            feels = round(cur.get("apparent_temperature", temp))
+            humidity = round(cur.get("relative_humidity_2m", 0))
+            wind = round(cur.get("wind_speed_10m", 0))
+
+            daily = data.get("daily", {})
+            dt_ = daily.get("time", [])
+            dmax = daily.get("temperature_2m_max", [])
+            dmin = daily.get("temperature_2m_min", [])
+            dcode = daily.get("weather_code", [])
+            hi = round(dmax[0]) if dmax else temp
+            lo = round(dmin[0]) if dmin else temp
+
+            hly = data.get("hourly", {})
+            ht = hly.get("time", [])
+            hp = hly.get("temperature_2m", [])
+            hc = hly.get("weather_code", [])
+            start = ht.index(cur.get("time")) if cur.get("time") in ht else 0
+            hours = []
+            for i in range(start, min(start + 12, len(ht))):
+                _, hcid = _wx(hc[i] if i < len(hc) else 0, True)
+                hours.append({"t": _fmt_hour(ht[i]), "temp": f"{round(hp[i])}°", "icon": hcid})
+
+            days = []
+            for i in range(min(7, len(dt_))):
+                _, dcid = _wx(dcode[i] if i < len(dcode) else 0, True)
+                days.append({"d": "Today" if i == 0 else _fmt_day(dt_[i]),
+                             "hi": f"{round(dmax[i])}°", "lo": f"{round(dmin[i])}°", "icon": dcid})
+
+            await ui.weather(
+                place=label, temp=f"{temp}°", cond=cond, icon=cid, feels=f"{feels}°",
+                hi=f"{hi}°", lo=f"{lo}°", humidity=f"{humidity}%", wind=f"{wind} mph",
+                is_day=is_day, hours=hours, days=days,
+            )
+            await params.result_callback(
+                {"summary": f"It's {temp}° and {cond.lower()} in {label}, high {hi}° / low {lo}°."})
+        except Exception as e:
+            logger.exception("get_weather failed")
+            await params.result_callback({"error": f"Weather lookup choked: {e}"})
 
     async def search_products(params):
         q = (params.arguments or {}).get("query", "")
@@ -624,15 +818,49 @@ def register_tool_handlers(llm, ui, task, speak_filler: bool = True):
             logger.exception("find_specialist failed")
             await params.result_callback({"error": f"I couldn't complete the specialist search: {e}"})
 
+    # ---- memory: remember / recall / forget (local + instant → no filler) ----
+    async def remember(params):
+        args = params.arguments or {}
+        fact = (args.get("fact") or "").strip()
+        category = (args.get("category") or "preference").strip().lower()
+        saved = memory.add(user_id, fact, category)
+        if not saved:
+            await params.result_callback({"error": "There was nothing to remember."})
+            return
+        await params.result_callback({"summary": f"Noted and saved: {saved['text']}"})
+
+    async def recall(params):
+        q = (params.arguments or {}).get("query", "")
+        hits = memory.query(user_id, q)
+        if not hits:
+            miss = f"Nothing stored about '{q}'." if q else "Nothing stored on that yet."
+            await params.result_callback({"summary": miss})
+            return
+        await params.result_callback({"summary": "; ".join(f["text"] for f in hits)})
+
+    async def forget(params):
+        match = (params.arguments or {}).get("fact", "")
+        removed = memory.remove(user_id, match)
+        if not removed:
+            await params.result_callback({"summary": f"Nothing matching '{match}' to forget."})
+            return
+        await params.result_callback({"summary": "Forgotten: " + "; ".join(f["text"] for f in removed)})
+
     llm.register_function("search_places", search_places)
     llm.register_function("search_web", search_web)
     llm.register_function("search_images", search_images)
+    llm.register_function("search_videos", search_videos)
     llm.register_function("search_products", search_products)
+    llm.register_function("get_weather", get_weather)
+    llm.register_function("end_call", end_call)
     llm.register_function("get_directions", get_directions)
     llm.register_function("start_navigation", start_navigation)
     llm.register_function("find_specialist", find_specialist)
-    logger.info("Registered tools: search_places, search_web, search_images, search_products, "
-                "get_directions, start_navigation, find_specialist")
+    llm.register_function("remember", remember)
+    llm.register_function("recall", recall)
+    llm.register_function("forget", forget)
+    logger.info("Registered tools: search_places, search_web, search_images, search_videos, "
+                "search_products, get_weather, get_directions, start_navigation, find_specialist")
 
 
 # ---------------------------------------------------------------- schemas (pure data)
@@ -661,11 +889,38 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
         required=["query"],
     ),
     FunctionSchema(
+        name="search_videos",
+        description=("Show a grid of VIDEOS (YouTube) the user can play. Use when they want to WATCH something — "
+                     "a how-to, a clip, a trailer, a music video, a talk. Once one is playing you can SEE the "
+                     "video and answer questions about what's happening in it."),
+        properties={"query": {"type": "string", "description": "What videos to find, e.g. 'how to poach an egg'."}},
+        required=["query"],
+    ),
+    FunctionSchema(
         name="search_products",
         description=("Show SHOPPING results with prices and stores. Use when the user wants to buy something or "
                      "compare products/prices."),
         properties={"query": {"type": "string", "description": "The product to shop for."}},
         required=["query"],
+    ),
+    FunctionSchema(
+        name="get_weather",
+        description=("Show the WEATHER — current conditions plus an hourly and 7-day forecast. Use when the user "
+                     "asks about the weather, temperature, rain/snow, or what to wear / whether to bring a jacket."),
+        properties={
+            "location": {"type": "string",
+                         "description": "City or place to check, e.g. 'Portland' or 'Ballard'. Omit for the user's current location."},
+        },
+        required=[],
+    ),
+    FunctionSchema(
+        name="end_call",
+        description=("Hang up / end the voice call. Call this ONLY when the user clearly wants to stop talking — "
+                     "'bye', 'goodbye', 'talk later', 'that's all', 'I'm done', 'we're done', 'end the call', "
+                     "'catch you later'. Say a SHORT sign-off first, then call this in the SAME turn. Do NOT call "
+                     "it just because the conversation paused."),
+        properties={},
+        required=[],
     ),
     FunctionSchema(
         name="get_directions",
@@ -690,6 +945,34 @@ NOVA_TOOLS = ToolsSchema(standard_tools=[
                      "description": "Travel mode. Defaults to driving."},
         },
         required=["destination"],
+    ),
+    FunctionSchema(
+        name="remember",
+        description=("Save a lasting fact about the user to your memory so you still know it in future "
+                     "conversations — their name, tastes/preferences, the people and places in their life, "
+                     "routines, ongoing projects. Use it PROACTIVELY the moment the user shares something "
+                     "stable and worth keeping, without being asked. Confirm FIRST before saving anything "
+                     "sensitive (health, finances, relationships, a precise home address)."),
+        properties={
+            "fact": {"type": "string", "description": "The fact to remember, e.g. 'Lives in Ballard' or 'Hates cilantro'."},
+            "category": {"type": "string", "enum": list(memory.CATEGORIES),
+                         "description": "preference | person | place | routine | project."},
+        },
+        required=["fact"],
+    ),
+    FunctionSchema(
+        name="recall",
+        description=("Look something up in your memory of the user when you need a detail you might have stored "
+                     "before — a name, a preference, an address, a person in their life."),
+        properties={"query": {"type": "string", "description": "What to look up, e.g. 'coffee order' or 'sister'."}},
+        required=["query"],
+    ),
+    FunctionSchema(
+        name="forget",
+        description=("Remove a fact from your memory when the user asks you to forget it, or corrects something "
+                     "that has changed."),
+        properties={"fact": {"type": "string", "description": "The fact (or a phrase from it) to remove."}},
+        required=["fact"],
     ),
 ])
 

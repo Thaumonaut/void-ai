@@ -55,6 +55,17 @@ class UiBridge:
     async def fullscreen(self, on: bool = True) -> None:
         await self._send("fullscreen", on=on)
 
+    async def working(self, view: str, label: Optional[str] = None) -> None:
+        # Show a "Nova is working…" loading pill on `view` the instant a tool fires (before its
+        # results land) — instant feedback that covers the fetch gap, and the ONLY quick signal on
+        # the duplex/S2S path (which has no spoken filler). The content op clears it on success; the
+        # client also auto-clears after a timeout so an errored tool can't leave it spinning.
+        await self._send("working", view=view, label=label)
+
+    async def end_call(self) -> None:
+        # Hang up. The client waits for the agent's sign-off to finish before dropping the session.
+        await self._send("end_call")
+
     # --- content (each opens + switches its view; collapse=True also collapses Nova) ---
     async def images(
         self, items: list, query: Optional[str] = None,
@@ -73,6 +84,26 @@ class UiBridge:
         self, items: list, query: Optional[str] = None, collapse: bool = True,
     ) -> None:
         await self._send("products", items=items, query=query, collapse=collapse)
+
+    async def videos(
+        self, items: list, query: Optional[str] = None, collapse: bool = True,
+    ) -> None:
+        # items: [{title, channel, dur, url, id, thumb}] — a grid whose items play in a WKWebView.
+        await self._send("videos", items=items, query=query, collapse=collapse)
+
+    async def weather(
+        self, place: str, temp: str, cond: str, icon: str,
+        feels: Optional[str] = None, hi: Optional[str] = None, lo: Optional[str] = None,
+        humidity: Optional[str] = None, wind: Optional[str] = None, is_day: bool = True,
+        hours: Optional[list] = None, days: Optional[list] = None, collapse: bool = True,
+    ) -> None:
+        # All display values are pre-formatted strings ("62°", "8 mph"); icon is a condition id
+        # (clear-day/clear-night/partly/cloudy/rain/snow/storm/fog). hours/days carry per-item icons.
+        await self._send(
+            "weather", place=place, temp=temp, cond=cond, icon=icon, feels=feels,
+            hi=hi, lo=lo, humidity=humidity, wind=wind, is_day=is_day,
+            hours=hours, days=days, collapse=collapse,
+        )
 
     async def web(
         self, url: str, title: Optional[str] = None, blocks: Optional[list] = None,

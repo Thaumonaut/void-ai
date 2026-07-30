@@ -9,6 +9,7 @@ dependencies = [
     "pipecat-ai[soniox,openrouter,silero,webrtc,runner,google]>=1.6.0",
     "python-dotenv>=1.0",
     "loguru>=0.7",
+    "pillow>=12.3.0",
 ]
 
 [tool.uv]

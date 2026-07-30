@@ -24,5 +24,8 @@ fn main() {
         // the framework makes the WKWebView/WKWebViewConfiguration ObjC classes resolvable
         // at runtime via class!(); without it class!(WKWebView) would return nil → crash.
         println!("cargo:rustc-link-lib=framework=WebKit");
+        // PhotosUI for the photo picker (see src/ios_photos.rs) — same story: without it
+        // class!(PHPickerViewController)/class!(PHPickerConfiguration) can't resolve → crash.
+        println!("cargo:rustc-link-lib=framework=PhotosUI");
     }
 }

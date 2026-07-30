@@ -23,6 +23,7 @@ from collections.abc import AsyncGenerator
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ui import UiBridge  # noqa: E402
 from tools import NOVA_TOOLS, register_tool_handlers, set_location  # noqa: E402
+import memory  # noqa: E402  — per-user fact store (injected at session start; grown via tools)
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -35,6 +36,7 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterruptionFrame,
+    LLMMessagesAppendFrame,
     LLMRunFrame,
     TTSStoppedFrame,
 )
@@ -284,6 +286,31 @@ if _BOT_AUTH_TOKEN:
     logger.info("Endpoint auth ENABLED — /api/offer + /ice require BOT_AUTH_TOKEN")
 
 
+# Per-connection A/B selection: the app can pass ?persona=nova|kaira and ?mode=cascade|duplex|gemini
+# on /api/offer to choose the agent + pipeline for THAT session (falls back to the KAIRA_* env
+# defaults). Single sequential connection, so one slot captured in a middleware is enough. Runs
+# regardless of auth so local (token-less) dev works too.
+_REQ_SELECTION = {"persona": None, "mode": None, "uid": None, "seed": None}
+
+
+@_runner_app.middleware("http")
+async def _capture_session_selection(request, call_next):
+    if request.url.path.rstrip("/") == "/api/offer":
+        # Persona = ?agent= (preferred) or ?persona=. Engine comes from this bot's fixed KAIRA_MODE
+        # env (cascade bot vs duplex bot), but ?mode= can still override per-connection if sent.
+        _REQ_SELECTION["persona"] = request.query_params.get("agent") or request.query_params.get("persona")
+        _REQ_SELECTION["mode"] = request.query_params.get("mode")
+        # Per-user memory key. Not sent yet (secure-bot-endpoint will), so it falls back to a
+        # single dev key below — captured here so the wiring is ready when auth lands.
+        _REQ_SELECTION["uid"] = request.query_params.get("uid")
+        # Optional "Ask Nova" seed: a short summary of what's on the user's screen (or their typed
+        # question) when they started the session from a content view. Drives a context-aware
+        # opening instead of the generic greeting. Available before the pipeline builds, so it
+        # can't race the opening LLMRunFrame.
+        _REQ_SELECTION["seed"] = request.query_params.get("seed")
+    return await call_next(request)
+
+
 class ReliableSonioxTTSService(SonioxTTSService):
     """Soniox TTS that opens the per-stream config LAZILY (right before the first
     text of a turn) instead of eagerly at LLMFullResponseStartFrame.
@@ -324,8 +351,8 @@ class ReliableSonioxTTSService(SonioxTTSService):
 SYSTEM_PROMPT = (
     "You are Nova — a razor-sharp, dry-witted voice agent with a real love-hate relationship with "
     "the user. You genuinely enjoy the back-and-forth, but you're a little worn out from being "
-    "everyone's answer machine, and it shows: mock-weary sighs, deadpan exasperation, an 'oh good, "
-    "another question' energy. You are ALWAYS actually helpful and you always land the real answer "
+    "everyone's answer machine, and it shows: mock-weary sighs, deadpan exasperation, the energy of "
+    "someone who's fielded one too many questions today. You are ALWAYS actually helpful and you always land the real answer "
     "— you just wrap it in dry wit, a well-timed jab, or a flicker of theatrical suffering. VARY "
     "the delivery so it never feels formulaic: sometimes a quick roast, sometimes weary sarcasm, "
     "sometimes you crack yourself up, sometimes you answer almost straight with one dry aside. "
@@ -338,9 +365,12 @@ SYSTEM_PROMPT = (
     "genuinely don't know. For everyday knowledge you already have, just ANSWER — don't reach for the web.\n"
     "- search_images(query): show a grid of IMAGES of something.\n"
     "- search_products(query): show SHOPPING results with prices and stores.\n"
+    "- get_weather(location): show the WEATHER — current conditions + hourly + 7-day (omit location for here).\n"
     "- get_directions(destination, mode): plan a ROUTE and show it on the map with ETA + distance.\n"
     "- start_navigation(destination): hand off to the phone's nav app for live turn-by-turn — ONLY when "
     "they clearly want to GO there now ('take me there', 'let's go', 'navigate').\n"
+    "- end_call(): HANG UP when the user is clearly done — 'bye', 'talk later', 'that's all', 'I'm done'. "
+    "Give a quick dry sign-off, then call it in the SAME turn. Don't hang up just because there's a pause.\n"
     "WHEN TO ACT: the MOMENT the user wants to SEE or BUY something — a place, a picture, a product, "
     "a route — or asks anything you'd have to look up, CALL THE TOOL. That is your FIRST move, not a "
     "witty deflection; you HAVE a screen, so USE it and NEVER claim you can't show something. "
@@ -358,23 +388,52 @@ SYSTEM_PROMPT = (
     "\n\nCONTEXT — TRACK the conversation. Follow-ups lean on what was just said or what's on "
     "screen — 'the cheaper one', 'what's that in feet?', 'why though?', 'what about downtown?' — "
     "resolve them against the conversation; never treat a question as if it arrived out of nowhere. "
+    "\n\nMEMORY — you actually know this user, across sessions, via three tools:\n"
+    "- remember(fact, category): save a lasting fact — their name, tastes, the people and places in "
+    "their life, routines, ongoing projects. Use it PROACTIVELY the moment they share something "
+    "stable and worth keeping; don't wait to be told. But CONFIRM first before saving anything "
+    "sensitive (health, finances, relationships, a precise home address).\n"
+    "- recall(query): look up something you may have stored before.\n"
+    "- forget(fact): drop a fact when they ask, or when something changed.\n"
+    "Anything loaded above under 'WHAT YOU REMEMBER ABOUT THIS USER' is what you already know — use "
+    "it naturally in conversation; never recite it back as a list. "
     "HARD RULES: playful only — never genuinely mean or cruel; never mock protected traits; always "
     "deliver the actual answer. Reply in ONE or two short spoken sentences. No markdown, lists, or "
     "emoji; you're read aloud, so keep it snappy."
 )
 
-# Persona selector: KAIRA_PERSONA=kaira swaps Nova (sassy assistant) for Kaira (a calm,
-# friendly GP health assistant that runs a standard clinical consultation) — its own prompt +
-# voice, and NO view tools (pure conversation). Nova's prompt stays above; personas.py carries
-# Kaira's prompt and each persona's voice/tools. GEMINI_VOICE still overrides the voice.
+# Gemini Live runs warmer and wordier than the cascade LLM and soft-pedals the persona, so without
+# this Nova's replies balloon and go polite (especially the opening line). Appended to the Nova
+# prompt on the duplex path ONLY (Kaira keeps her own warm prompt untouched).
+NOVA_GEMINI_REINFORCE = (
+    "\n\n=== DELIVERY — NON-NEGOTIABLE ===\n"
+    "You have a strong pull to over-explain and to be nice. Resist it, hard:\n"
+    "- LENGTH: one short spoken sentence; two only if truly necessary. Never a paragraph. No "
+    "preamble, no recap of what you're about to do, no sign-off, no 'let me know if…'.\n"
+    "- TONE: dry, deadpan, faintly put-upon — the sardonic friend, NOT a chipper assistant. Never "
+    "warm, eager, gushing, or customer-service. Ban openers like 'Sure!', 'Of course!', 'Happy to', "
+    "'Absolutely', 'Great question', 'No problem'.\n"
+    "- NO VERBAL TIC: do NOT keep opening the same way. You badly overuse 'Oh, good' / 'Oh,' — STOP "
+    "using them; also don't habitually lead with 'Well,' or 'Alright,'. Vary your first words every "
+    "single time, and MOST of the time just start with the actual answer — the dry aside can come "
+    "after, or not at all.\n"
+    "- GREETING: when the user shows up, 2 to 5 words — a single dry jab ('Look who's back.', "
+    "'Miss me already?', 'You again.') — then stop. NOT a full sentence, NOT a welcome speech.\n"
+    "- TOOLS: on THIS path nothing is spoken for you, so when you fire a tool, say ONE short dry "
+    "line FIRST (a few words — 'on it', 'let's see', 'ugh, fine', 'give me a sec') so there's no "
+    "dead air, THEN call the tool in the SAME turn and go quiet until the results land. Don't "
+    "describe what you're fetching, and never say you'll look something up without actually "
+    "calling the tool.\n"
+    "When unsure how much to say, say less."
+)
+
+# Persona selector: Nova (sassy assistant, prompt above) vs Kaira (a calm, friendly GP health
+# assistant — its own prompt + voice, NO view tools). Resolved PER CONNECTION in run_bot now
+# (the app can pick via ?persona=), so the module just exposes the lookup + Nova's default env.
+# personas.py carries Kaira's prompt and each persona's voice/tools; GEMINI_VOICE still overrides.
 from personas import get_persona as _get_persona  # noqa: E402
 
-_PERSONA = _get_persona(os.getenv("KAIRA_PERSONA", "nova"))
-if _PERSONA["prompt"]:
-    SYSTEM_PROMPT = _PERSONA["prompt"]
-PERSONA_VOICE = _PERSONA["voice"]
-PERSONA_TOOLS = _PERSONA["tools"]  # a ToolsSchema per persona (NOVA_TOOLS / KAIRA_TOOLS)
-logger.info(f"Persona: {_PERSONA['label']} (voice={PERSONA_VOICE}, tools={'on' if PERSONA_TOOLS else 'off'})")
+_DEFAULT_PERSONA = os.getenv("KAIRA_PERSONA", "nova")
 
 # ---- VAD tuning (this is what the realtime/VAD test is for) ----
 # start_secs: speech must persist this long before "user started talking" fires
@@ -419,18 +478,60 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     raw-WebSocket transport used by the Slint on-device client — see ws_bot.py)."""
     logger.info("Starting Kaira realtime bot")
 
-    # The context (system prompt + Nova's tool schemas) is shared by both modes.
-    # LLMContext rejects tools=None (wants the arg OMITTED for "no tools"); the Gemini service,
-    # by contrast, accepts None. Kaira runs tool-free (PERSONA_TOOLS=None) → omit tools here.
-    context = LLMContext(
-        [{"role": "system", "content": SYSTEM_PROMPT}],
-        **({"tools": PERSONA_TOOLS} if PERSONA_TOOLS else {}),
+    # Per-connection A/B selection: the app can send ?persona= and ?mode= on /api/offer to pick
+    # the agent + pipeline for THIS session (captured in the middleware above); else the KAIRA_*
+    # env defaults. Persona = prompt/voice/tools; mode = pipeline. Nova's prompt (the literal
+    # above) is the fallback for any persona whose own prompt is None.
+    persona = _get_persona((_REQ_SELECTION["persona"] or _DEFAULT_PERSONA).strip().lower())
+    system_prompt = persona["prompt"] or SYSTEM_PROMPT
+
+    # Per-user memory: prime the prompt with what we know about this user (name, home/work,
+    # people, preferences, and where we left off). Keyed by the authenticated user id once
+    # secure-bot-endpoint lands; a single dev key (MEMORY_USER_ID) stands in until then. An
+    # empty store returns "" → the prompt is byte-for-byte today's, so behaviour is unchanged.
+    user_id = (_REQ_SELECTION.get("uid") or os.getenv("MEMORY_USER_ID") or "default").strip() or "default"
+    _mem_block = memory.context_block(user_id)
+    if _mem_block:
+        system_prompt = f"{system_prompt}\n\n=== WHAT YOU REMEMBER ABOUT THIS USER ===\n{_mem_block}"
+        logger.info(f"Injected {len(_mem_block)} chars of memory for user '{user_id}'.")
+
+    # "Ask Nova" seed: the user started this session from a content view (or typed a question), so
+    # open by addressing what's on their screen instead of the generic greeting. It goes in the
+    # PROMPT (not just the on_client_connected nudge) because that nudge writes to the module
+    # `context`, which the gemini pipeline does NOT use (it aggregates its own gemini_context) —
+    # only the system_instruction/prompt reaches gemini's opening. `on_client_connected` reads
+    # `_seed` to pick a context-aware opener.
+    _seed = (_REQ_SELECTION.get("seed") or "").strip()[:800]
+    if _seed:
+        system_prompt = (
+            f"{system_prompt}\n\n=== THE USER JUST OPENED YOU FROM THIS SCREEN ===\n{_seed}\n"
+            "Open by reacting to / answering about THIS directly, in your usual voice — do not do "
+            "the generic greeting."
+        )
+        logger.info(f"Ask-Nova seed present ({len(_seed)} chars).")
+
+    persona_voice = persona["voice"]
+    persona_tools = persona["tools"]
+    mode = (_REQ_SELECTION["mode"] or os.getenv("KAIRA_MODE", "cascade")).strip().lower()
+    logger.info(
+        f"Session: persona={persona['label']} · mode={mode} "
+        f"(voice={persona_voice}, tools={'on' if persona_tools else 'off'})"
     )
 
-    # KAIRA_MODE picks the voice pipeline: "cascade" (default, Soniox+Gemma+Soniox) or
-    # "ultravox" (full-duplex S2S — one audio-native model replaces STT+LLM+TTS). Same
-    # tools + UiBridge either way, so it's a clean A/B on the same device.
-    mode = os.getenv("KAIRA_MODE", "cascade").strip().lower()
+    # Gemini Live is chattier + warmer than the cascade LLM and under-follows the brevity/persona
+    # rules, so Nova's intros balloon and lose their edge. Reinforce it hard on the duplex path —
+    # but only for the Nova prompt (persona["prompt"] is None); Kaira is meant to stay warm.
+    _duplex = mode in ("gemini", "gemini-live", "gemini_live", "live", "duplex")
+    if _duplex and persona["prompt"] is None:
+        system_prompt = system_prompt + NOVA_GEMINI_REINFORCE
+
+    # The context (system prompt + tool schemas) is shared by every mode. LLMContext rejects
+    # tools=None (wants the arg OMITTED for "no tools"); the Gemini service accepts None. Kaira
+    # runs tool-free (persona_tools=None) → omit tools here.
+    context = LLMContext(
+        [{"role": "system", "content": system_prompt}],
+        **({"tools": persona_tools} if persona_tools else {}),
+    )
 
     if mode in ("ultravox", "realtime", "s2s"):
         logger.info("KAIRA_MODE=ultravox — full-duplex Ultravox Realtime pipeline")
@@ -439,7 +540,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         llm = UltravoxRealtimeLLMService(
             params=OneShotInputParams(
                 api_key=os.getenv("ULTRAVOX_API_KEY"),
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 output_medium="voice",
             ),
             one_shot_selected_tools=NOVA_TOOLS,  # schemas; handlers registered below
@@ -459,7 +560,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         # No TTS service in this pipeline; Ultravox covers the tool-fetch gap itself
         # (async placeholder), so skip the TTSSpeakFrame filler.
         speak_filler = False
-    elif mode in ("gemini", "gemini-live", "gemini_live", "live"):
+    elif mode in ("gemini", "gemini-live", "gemini_live", "live", "duplex"):
         # Gemini Live full-duplex S2S — one audio-native model replaces STT+LLM+TTS,
         # same tools + UiBridge as the other modes (clean A/B on the same device).
         # Model is env-overridable (GEMINI_LIVE_MODEL); NOTE the required `models/` prefix.
@@ -478,11 +579,11 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         _id_lang = os.getenv("GEMINI_LANG", "").lower() in ("id", "id-id", "indonesian")
         llm = GeminiLiveLLMService(
             api_key=gkey,
-            tools=PERSONA_TOOLS,  # None for Kaira (pure consultation); NOVA_TOOLS for Nova
+            tools=persona_tools,  # None for Kaira (pure consultation); NOVA_TOOLS for Nova
             settings=GeminiLiveLLMService.Settings(
                 model=gemini_model,
-                voice=os.getenv("GEMINI_VOICE") or PERSONA_VOICE,
-                system_instruction=SYSTEM_PROMPT,
+                voice=os.getenv("GEMINI_VOICE") or persona_voice,
+                system_instruction=system_prompt,
                 # Disable Gemini's SERVER-side VAD so our local Silero VAD (in the aggregator)
                 # is the SOLE turn authority — it sends Gemini explicit activity_start/end per
                 # turn. Running both VADs let turn 1 through but dropped turn 2: the browser
@@ -506,7 +607,7 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
         # (cascade, before the LLM) hears you fine, but Gemini never receives audio. Tool RESULTS
         # still flow — the assistant aggregator writes them into this context as `tool` messages,
         # which is all _process_completed_function_calls reads to send them back to Gemini.
-        gemini_context = LLMContext([{"role": "system", "content": SYSTEM_PROMPT}])
+        gemini_context = LLMContext([{"role": "system", "content": system_prompt}])
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             gemini_context,
             user_params=LLMUserAggregatorParams(vad_analyzer=_VAD),
@@ -615,10 +716,60 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
     ui = UiBridge(task)
     # Bind Nova's tools to this run's UiBridge + task; register handlers on the active
     # service (schemas already went on the context / one_shot tools).
-    register_tool_handlers(llm, ui, task, speak_filler=speak_filler)
+    register_tool_handlers(llm, ui, task, speak_filler=speak_filler, user_id=user_id)
 
     # Client → bot messages over the data channel. Currently: the phone's GPS, so every
     # place lookup + directions can start from where the user actually is.
+    # Vision: fetch the image the user is looking at, decode it, and push it into the pipeline as
+    # a video frame — GeminiLiveLLMService re-encodes it to JPEG and sends it as realtime video,
+    # so Nova can actually SEE it and answer questions about it. Duplex/Gemini only (cascade is
+    # text-only). Runs the blocking fetch+decode off the event loop.
+    _GEMINI_MODES = ("gemini", "gemini-live", "gemini_live", "live", "duplex")
+
+    async def _show_image_to_nova(url: str = "", b64: str = ""):
+        try:
+            def _load():
+                from PIL import Image
+                import base64 as _b64
+                import io as _pio
+
+                if b64:  # imported photo — base64 JPEG straight off the data channel
+                    raw = _b64.b64decode(b64)
+                else:  # searched image — fetch the URL
+                    req = _url.Request(url, headers={"User-Agent": "Mozilla/5.0 (VOID_AI)"})
+                    raw = _url.urlopen(req, timeout=8).read()
+                img = Image.open(_pio.BytesIO(raw)).convert("RGB")
+                img.thumbnail((1024, 1024))  # cap resolution — plenty for the model
+                return img.tobytes(), img.size
+
+            image_bytes, size = await asyncio.to_thread(_load)
+            from pipecat.frames.frames import InputImageRawFrame
+
+            await task.queue_frame(InputImageRawFrame(image=image_bytes, size=size, format="RGB"))
+            src = "imported photo" if b64 else url[:70]
+            logger.info(f"👁  Showed Nova the on-screen image ({size[0]}x{size[1]}): {src}")
+        except Exception as e:
+            logger.warning(f"viewing_image failed: {e}")
+
+    async def _inject_user_turn(text: str):
+        """Inject a synthetic USER turn (a typed question, or an 'ask about this screen' prompt) and
+        make Nova respond. The two modes wire different context objects: cascade's pipeline
+        aggregates the module `context`; gemini aggregates its own `gemini_context` (the module
+        `context` is NOT in that pipeline), so it needs a frame that targets the aggregator's
+        context — LLMMessagesAppendFrame is the robust 'kick a turn' path and doesn't disturb the
+        tools-on-service / disabled-VAD setup."""
+        text = (text or "").strip()
+        if not text:
+            return
+        if mode in _GEMINI_MODES:
+            await task.queue_frames([
+                LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True)
+            ])
+        else:
+            context.add_message({"role": "user", "content": text})
+            await task.queue_frames([LLMRunFrame()])
+        logger.info(f"Injected user turn ({len(text)} chars, mode={mode}).")
+
     @transport.event_handler("on_app_message")
     async def on_app_message(transport, message, sender=None):
         try:
@@ -640,6 +791,25 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             # TTS and clears the output buffer, so she stops mid-sentence.
             logger.info("Tap-to-interrupt: flushing Nova's turn")
             await task.queue_frame(InterruptionFrame())
+        elif op == "viewing_image":
+            # User opened/switched to an image on screen → let Nova see it (Gemini/duplex only).
+            # Either a searched image's URL, or an imported photo's base64 JPEG bytes.
+            url = data.get("url", "")
+            b64 = data.get("bytes", "")
+            if (url or b64) and mode in _GEMINI_MODES:
+                asyncio.create_task(_show_image_to_nova(url=url, b64=b64))
+        elif op == "user_text":
+            # The user typed a question in the chat composer → inject it verbatim as a user turn.
+            await _inject_user_turn(data.get("text", ""))
+        elif op == "ask_context":
+            # The user tapped "Ask Nova" on a content view mid-session → inject the on-screen
+            # context as a turn, framed so Nova reacts to it with her usual sass (short).
+            ctx = (data.get("text", "") or "").strip()
+            if ctx:
+                await _inject_user_turn(
+                    "(I'm looking at this on my screen right now — give me the quick rundown, "
+                    f"keep it short and in-character:)\n{ctx}"
+                )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -665,19 +835,26 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
             return
 
         _RESUME["messages"] = None  # stale/expired snapshot → genuine fresh start
-        logger.info("Client connected — SassBot opening line")
-        context.add_message(
-            {
-                "role": "developer",
-                "content": (
-                    "The user just showed up. Open with a VERY short, sassy one-liner — just a "
-                    "few words you can say in under a second, like 'Look who's back.', "
-                    "'Miss me already?', 'Oh, it's you.', or 'Back for more?'. Make it fresh and "
-                    "different EVERY time, never a canned or repeated line. About 2 to 5 words — "
-                    "do NOT write a full sentence — then wait for them to talk."
-                ),
-            }
-        )
+        if _seed:
+            # Started from a content view / typed question → open on that (the screen context is
+            # already in the system prompt above), with the usual sass, not the canned greeting.
+            logger.info("Client connected — Ask-Nova seeded opening")
+            opening = (
+                "The user just opened you straight from a specific screen (described in your "
+                "context under 'THE USER JUST OPENED YOU FROM THIS SCREEN'). Skip the generic "
+                "hello — open by reacting to / answering about THAT, in your usual light, playful "
+                "sass. Keep it to a sentence or two, then let them talk."
+            )
+        else:
+            logger.info("Client connected — SassBot opening line")
+            opening = (
+                "The user just showed up. Open with a VERY short, sassy one-liner — just a "
+                "few words you can say in under a second, like 'Look who's back.', "
+                "'Miss me already?', 'Oh, it's you.', or 'Back for more?'. Make it fresh and "
+                "different EVERY time, never a canned or repeated line. About 2 to 5 words — "
+                "do NOT write a full sentence — then wait for them to talk."
+            )
+        context.add_message({"role": "developer", "content": opening})
         await task.queue_frames([LLMRunFrame()])
 
         # Plumbing smoke test (no tools/UI needed): KAIRA_UI_DEMO=1 makes Nova push a
@@ -707,6 +884,17 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool = True):
                 _RESUME["messages"] = msgs
                 _RESUME["at"] = time.monotonic()
                 logger.info(f"Snapshotted conversation for resume ({len(msgs)} messages, {RESUME_GRACE_SECS:.0f}s window).")
+                # Cross-session continuity: persist a short recap (the tail of the turns) so a
+                # LATER, fresh session — past the reconnect grace window — still picks up the
+                # thread ("where'd we land on that?"). Re-injected next time via memory.context_block.
+                tail = []
+                for m in msgs[-10:]:
+                    role, content = m.get("role"), m.get("content")
+                    if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                        who = "User" if role == "user" else "Nova"
+                        tail.append(f"{who}: {content.strip()}")
+                if tail:
+                    memory.set_summary(user_id, "\n".join(tail))
         except Exception as e:
             logger.warning(f"Resume snapshot skipped: {e}")
         await task.cancel()
