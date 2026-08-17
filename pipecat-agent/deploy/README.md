@@ -36,6 +36,34 @@ ssh -i ~/.ssh/voidai_do root@$DROPLET "docker logs -f voidai-bot"
 `kaira-slint/src/lib.rs` → iOS `DEFAULT_BOT = "http://<DROPLET-IP>:8080/api/offer"`, rebuild
 in Xcode. (ATS already allows plain HTTP; the client uses no TURN/`/ice`.)
 
+## 5. Browser access from a phone (`/client` over HTTPS)
+The runner's prebuilt UI is a **browser mic app** — it calls `navigator.mediaDevices.getUserMedia`,
+which browsers only expose on a **secure context** (HTTPS, or `localhost`). So `/client` works at
+`http://localhost:7860` but hangs forever at `http://<ip>:8080/client` — the bundle has no
+`isSecureContext` guard, so it never reports why. `/status` still answers, which makes it look like
+a network fault. It isn't. (The **native app** is a browser-free client, so none of this affects it.)
+
+`tls-setup.sh` fixes that without owning a domain, using `sslip.io` wildcard DNS
+(`nova.<ip>.sslip.io` resolves to `<ip>`, so Let's Encrypt HTTP-01 just works):
+
+```bash
+ssh root@$DROPLET "cd /opt/voidai && bash deploy/tls-setup.sh"   # prints the password
+```
+
+It is **additive** — it installs Caddy alongside the running containers and never rebuilds or
+restarts them; the plain-HTTP `:8080`/`:8081` endpoints the app uses are untouched.
+
+```
+https://nova.<ip>.sslip.io/client/     ->  127.0.0.1:8080
+https://kaira.<ip>.sslip.io/client/    ->  127.0.0.1:8081
+```
+
+Two things it handles that HTTPS alone wouldn't:
+- **`x-bot-token`** — the prebuilt client can't send it, so `/api/offer` would 403 under
+  `BOT_AUTH_TOKEN`. Caddy reads the token from `.env` and injects it upstream.
+- **HTTP basic auth** — since that injection would otherwise leave the bots open to anyone who
+  guesses the hostname. Set your own with `WEB_PASSWORD=… bash deploy/tls-setup.sh`.
+
 ## Notes
 - `--network host` in the run command is essential — it keeps the container on the public
   interface so aiortc sees the real IP (Docker's bridge NAT would re-break it).

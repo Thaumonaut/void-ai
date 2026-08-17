@@ -18,6 +18,10 @@ fi
 if command -v ufw >/dev/null 2>&1; then
     ufw allow 22/tcp
     ufw allow 8080/tcp
+    # 8081 = the second persona's instance (KAIRA_PERSONA=kaira), which the app points
+    # Kaira at (see bot_url_for in kaira-slint/src/lib.rs). Started separately from this
+    # script, but the port has to be open or its signaling is dropped before it's reached.
+    ufw allow 8081/tcp
     ufw allow 10000:65535/udp
     ufw --force enable
 fi
