@@ -55,9 +55,13 @@ fi
 # port. Without it, Docker's bridge NAT re-creates the exact problem we left fly to escape.
 docker build -t voidai-bot .
 
-# The pre-rename single-container deployment held :8080 under this bare name; with
-# --network host it would fight the new cascade container for the port.
-docker rm -f voidai-bot >/dev/null 2>&1 || true
+# The instance table is authoritative, so clear EVERY previous voidai-bot* container --
+# including ones from an older naming scheme. Under --network host a survivor still holds
+# its port: a leftover voidai-bot-kaira on :8081 would make the new gemini container fail
+# to bind, and the bare voidai-bot did the same for :8080 before the rename.
+for c in $(docker ps -aq --filter 'name=^voidai-bot' 2>/dev/null); do
+    docker rm -f "$c" >/dev/null 2>&1 || true
+done
 
 while read -r name port persona mode; do
     echo "==> $name: persona=$persona mode=$mode port=$port"
