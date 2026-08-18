@@ -53,9 +53,13 @@ ssh root@$DROPLET "cd /opt/voidai && bash deploy/tls-setup.sh"   # prints the pa
 It is **additive** — it installs Caddy alongside the running containers and never rebuilds or
 restarts them; the plain-HTTP `:8080`/`:8081` endpoints the app uses are untouched.
 
+One hostname per instance, named for the **axis you are testing** rather than the persona,
+so the two pipelines sit side by side as two bookmarks:
+
 ```
-https://nova.<ip>.sslip.io/client/     ->  127.0.0.1:8080
-https://kaira.<ip>.sslip.io/client/    ->  127.0.0.1:8081
+https://cascade.<ip>.sslip.io/client/   ->  127.0.0.1:8080   (nova   / cascade)
+https://gemini.<ip>.sslip.io/client/    ->  127.0.0.1:8081   (kaira  / gemini)
+https://vesper.<ip>.sslip.io/client/    ->  127.0.0.1:8082   (vesper / gemini)
 ```
 
 Two things it handles that HTTPS alone wouldn't:
@@ -63,6 +67,27 @@ Two things it handles that HTTPS alone wouldn't:
   `BOT_AUTH_TOKEN`. Caddy reads the token from `.env` and injects it upstream.
 - **HTTP basic auth** — since that injection would otherwise leave the bots open to anyone who
   guesses the hostname. Set your own with `WEB_PASSWORD=… bash deploy/tls-setup.sh`.
+
+## Instances
+
+`instances.conf` is the single source of truth for both scripts — `do-setup.sh` reads it to
+decide what to run, `tls-setup.sh` reads it to decide what to expose:
+
+```
+# name     port  persona  mode
+cascade    8080  nova     cascade
+gemini     8081  kaira    gemini
+vesper     8082  vesper   gemini
+```
+
+Each row becomes a container (`voidai-bot-<name>`) started with `KAIRA_PERSONA` and
+`KAIRA_MODE` passed explicitly, and a matching HTTPS hostname. Add a row, re-run both
+scripts, and the port, firewall rule, container and certificate all follow.
+
+This exists because the modes used to live only in hand-typed `docker run` lines, so nothing
+on disk recorded which pipeline a port was actually serving — and the droplet quietly drifted
+from what this README claimed. `tls-setup.sh` embeds the same table as a fallback, since it is
+normally run through `curl | bash` with no sibling file to read.
 
 ## Notes
 - `--network host` in the run command is essential — it keeps the container on the public
