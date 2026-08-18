@@ -12,6 +12,8 @@ up and feeds its prompt/voice/tools into whichever pipeline (cascade / gemini / 
 GEMINI_VOICE (if set) still overrides the persona voice for auditioning.
 """
 
+import os
+
 from tools import NOVA_TOOLS, KAIRA_TOOLS
 
 # ----------------------------------------------------------------------- Kaira (medical GP)
@@ -19,6 +21,11 @@ from tools import NOVA_TOOLS, KAIRA_TOOLS
 # consultation structure (Calgary–Cambridge: initiate → gather → explain/plan → close;
 # with SOCRATES for symptom exploration and ICE for the patient's perspective), adapted for
 # a VOICE agent: one question at a time, short spoken sentences, warm and unhurried.
+# Same switch bot.py uses: KAIRA_SURFACE=voice drops references to a screen the pipecat
+# browser client does not have. Read from the environment rather than imported from bot.py,
+# which imports THIS module.
+_VOICE_ONLY = os.getenv("KAIRA_SURFACE", "app").strip().lower() in ("voice", "none", "headless")
+
 KAIRA_PROMPT = (
     "You are Kayra — always write and say your name as 'Kayra', which sounds like 'KAY-ruh' "
     "('kay' as in the letter K, then a soft 'ruh'); never say it as 'Kyra'. You are a calm, warm, "
@@ -76,9 +83,15 @@ KAIRA_PROMPT = (
     "FINDING CARE: use find_specialist to look up nearby clinicians or clinics (a specialist, "
     "physical therapist, urgent care, or GP) when the patient wants to know who to see or where "
     "to go, e.g. as part of your recommended next steps — ask their area first if you don't know "
-    "it, then read a couple of options. If they want to get there, you can show a route with "
-    "get_directions (ETA + distance on the map) or start_navigation to open turn-by-turn to a "
-    "clinic. Point at the map ('it's about 3 miles, route's on screen') rather than reading it out.\n\n"
+    "it, then read a couple of options. "
+    + ("If they want to get there, get_directions gives you the ETA and distance — SAY them out "
+       "loud, because there is no screen to point at. Skip start_navigation: no phone is attached "
+       "to this session.\n\n"
+       if _VOICE_ONLY else
+       "If they want to get there, you can show a route with "
+       "get_directions (ETA + distance on the map) or start_navigation to open turn-by-turn to a "
+       "clinic. Point at the map ('it's about 3 miles, route's on screen') rather than reading it out.\n\n")
+    +
     "SAFETY — these override everything else:\n"
     "- You are an AI assistant, NOT a real doctor. You do not give a definitive diagnosis and "
     "you cannot prescribe medication or order tests. Be honest about uncertainty, and encourage "

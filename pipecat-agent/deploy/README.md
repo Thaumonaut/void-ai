@@ -74,11 +74,23 @@ Two things it handles that HTTPS alone wouldn't:
 decide what to run, `tls-setup.sh` reads it to decide what to expose:
 
 ```
-# name     port  persona  mode
-cascade    8080  nova     cascade
-gemini     8081  kaira    gemini
-vesper     8082  vesper   gemini
+# name     port  persona  mode     surface
+cascade    8080  nova     cascade  voice
+gemini     8081  kaira    gemini   voice
+vesper     8082  vesper   gemini   voice
 ```
+
+`surface` picks how the agent delivers a tool result, via `KAIRA_SURFACE`:
+
+- **`voice`** — there is no screen. The agent SAYS the answer: the best two or three, with the
+  detail that decides it. Use this for the pipecat browser client and any prompt/voice test.
+- **`app`** (the default when the column is absent) — the Slint client, which really renders the
+  map/images/products, so the agent reacts to the display instead of reciting it.
+
+Only wording changes — same persona, same voice, same tools — so a voice-mode session is still
+a faithful test of the prompt. This matters because the UI messages go out over RTVI either
+way: with no client rendering them, screen-shaped wording like *"the third one's highway
+robbery"* points at an empty room and the user never hears the actual result.
 
 Each row becomes a container (`voidai-bot-<name>`) started with `KAIRA_PERSONA` and
 `KAIRA_MODE` passed explicitly, and a matching HTTPS hostname. Add a row, re-run both

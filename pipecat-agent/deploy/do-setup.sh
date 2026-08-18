@@ -15,9 +15,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo's pipecat-agent/ — the Dockerfile's build context
 
 # --- Instance table (name port persona mode) --------------------------------------------
-INSTANCES_DEFAULT='cascade 8080 nova cascade
-gemini 8081 kaira gemini
-vesper 8082 vesper gemini'
+INSTANCES_DEFAULT='cascade 8080 nova cascade voice
+gemini 8081 kaira gemini voice
+vesper 8082 vesper gemini voice'
 
 read_instances() {
     local src="" f
@@ -29,7 +29,7 @@ read_instances() {
         done
     fi
     [ -n "$src" ] || src=$INSTANCES_DEFAULT
-    printf '%s\n' "$src" | sed 's/#.*//' | awk 'NF>=4 {print $1, $2, $3, $4}'
+    printf '%s\n' "$src" | sed 's/#.*//' | awk 'NF>=4 {print $1, $2, $3, $4, (NF>=5 ? $5 : "app")}'
 }
 
 # --- Docker ---
@@ -42,7 +42,7 @@ fi
 # open the whole ephemeral range. (This box only runs the bot; that's fine.)
 if command -v ufw >/dev/null 2>&1; then
     ufw allow 22/tcp
-    while read -r name port persona mode; do
+    while read -r name port persona mode surface; do
         ufw allow "$port/tcp"   # the native app talks plain HTTP straight to these
     done < <(read_instances)
     ufw allow 10000:65535/udp
@@ -63,14 +63,15 @@ for c in $(docker ps -aq --filter 'name=^voidai-bot' 2>/dev/null); do
     docker rm -f "$c" >/dev/null 2>&1 || true
 done
 
-while read -r name port persona mode; do
-    echo "==> $name: persona=$persona mode=$mode port=$port"
+while read -r name port persona mode surface; do
+    echo "==> $name: persona=$persona mode=$mode surface=$surface port=$port"
     docker rm -f "voidai-bot-$name" >/dev/null 2>&1 || true
     docker run -d --name "voidai-bot-$name" \
         --network host \
         --env-file .env \
         -e "KAIRA_PERSONA=$persona" \
         -e "KAIRA_MODE=$mode" \
+        -e "KAIRA_SURFACE=$surface" \
         --restart unless-stopped \
         voidai-bot \
         uv run bot.py --host 0.0.0.0 --port "$port" -t webrtc
@@ -82,7 +83,7 @@ docker ps --filter name=voidai-bot --format '  {{.Names}}: {{.Status}}'
 IP=$(curl -fsS --max-time 10 http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null \
      || curl -s ifconfig.me || echo '?')
 echo "  public IP: $IP"
-while read -r name port persona mode; do
+while read -r name port persona mode surface; do
     echo "  $name ($persona/$mode): http://$IP:$port/api/offer   ·   health: /status"
 done < <(read_instances)
 echo "  HTTPS for phone browsers: bash deploy/tls-setup.sh"
